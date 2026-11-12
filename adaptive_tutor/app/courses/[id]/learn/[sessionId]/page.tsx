@@ -18,7 +18,8 @@ type Step = {
   topicTitle: string;
   level: number; // difficulty 1..5
   styleLabel: string;
-  stepNumber: number;
+  stepNumber: number; // current lesson, 1-based
+  completedSteps: number; // lessons finished so far
   totalSteps: number;
   reason: string | null; // why this content is shown
   lesson: { id: number; text: string; example: string | null } | null;
@@ -63,14 +64,17 @@ const NEXT_LABEL: Record<AnswerResult["decision"], string> = {
 
 // ─── Small pieces ────────────────────────────────────────────────────────────
 
-function ProgressBar({ current, total }: { current: number; total: number }) {
-  const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+// Visibility of system status: the bar fills as lessons are completed.
+function ProgressBar({ current, completed, total }: { current: number; completed: number; total: number }) {
+  const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
   return (
     <div className="flex items-center gap-3">
       <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-zinc-200">
         <div className="h-full rounded-full bg-zinc-900 transition-all duration-500" style={{ width: `${pct}%` }} />
       </div>
-      <span className="shrink-0 text-xs text-zinc-500">Lesson {current} of {total}</span>
+      <span className="shrink-0 text-xs text-zinc-500">
+        {completed >= total ? `All ${total} lessons done` : `Lesson ${current} of ${total}`}
+      </span>
     </div>
   );
 }
@@ -353,8 +357,9 @@ function SessionContent() {
     setBusy(true);
     try {
       const result = await apiService.post<AnswerResult>(`${base}/quizzes/${step.quiz!.id}/answers`, { answers, simulateWrong });
+      // The header keeps showing the level of the quiz just taken; the feedback
+      // box states any level change, and the next step loads the new level.
       setView({ kind: "feedback", step, result });
-      setHeader((h) => (h ? { ...h, level: result.newLevel } : h));
     } catch (e) {
       setView({ kind: "error", text: e instanceof Error ? e.message : "Something went wrong." });
     } finally {
@@ -377,7 +382,7 @@ function SessionContent() {
             )}
             {header?.mockMode && <MockBadge />}
           </div>
-          {header && <ProgressBar current={header.stepNumber} total={header.totalSteps} />}
+          {header && <ProgressBar current={header.stepNumber} completed={header.completedSteps} total={header.totalSteps} />}
         </div>
       </header>
 
@@ -422,6 +427,9 @@ function SessionContent() {
               <div className="mt-6 flex gap-2">
                 <Link href={`/courses/${courseId}/learn`} className="rounded-lg bg-zinc-900 px-5 py-2.5 text-sm font-medium text-white hover:bg-zinc-700">
                   Back to topics
+                </Link>
+                <Link href={`/courses/${courseId}/history`} className="rounded-lg border border-zinc-300 px-5 py-2.5 text-sm font-medium text-zinc-700 hover:bg-zinc-50">
+                  View history
                 </Link>
               </div>
             </div>

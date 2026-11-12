@@ -94,7 +94,8 @@ public class StepResponse
     public string TopicTitle { get; set; } = "";
     public int Level { get; set; }
     public string StyleLabel { get; set; } = "";
-    public int StepNumber { get; set; }             // 1-based, for the progress bar
+    public int StepNumber { get; set; }             // 1-based number of the current lesson
+    public int CompletedSteps { get; set; }         // lessons finished so far, for the progress bar
     public int TotalSteps { get; set; }
     public string? Reason { get; set; }             // "why am I seeing this?"
     public LessonDto? Lesson { get; set; }

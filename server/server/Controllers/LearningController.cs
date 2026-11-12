@@ -57,6 +57,10 @@ public class LearningController(LearningService learning) : ControllerBase
     public Task<IActionResult> SubmitAnswers(int courseId, int sessionId, int quizId, [FromBody] SubmitAnswersRequest request) =>
         Run(() => Task.FromResult<IActionResult>(Ok(learning.SubmitAnswers(courseId, sessionId, quizId, request))));
 
+    /// <summary>Past sessions and per-topic progress and difficulty.</summary>
+    [HttpGet("history")]
+    public IActionResult GetHistory(int courseId) => Ok(learning.GetHistory(courseId));
+
     private Task<IActionResult> Done() => Task.FromResult<IActionResult>(NoContent());
 
     /// <summary>

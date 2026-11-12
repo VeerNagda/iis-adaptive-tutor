@@ -265,6 +265,12 @@ function LearnContent() {
           <h1 className="flex-1 truncate text-sm font-semibold text-zinc-900">
             {course ? course.title : "…"} · Start Learning
           </h1>
+          <Link
+            href={`/courses/${id}/history`}
+            className="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+          >
+            History
+          </Link>
           {mockMode && <MockBadge />}
         </div>
       </header>

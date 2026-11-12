@@ -36,6 +36,12 @@ function CourseCard({ course }: { course: Course }) {
       <div className="flex items-center justify-between gap-3">
         <span className="text-xs text-zinc-400">{formatDate(course.createdAt)}</span>
         <Link
+          href={`/courses/${course.id}/history`}
+          className="ml-auto text-xs font-medium text-zinc-500 hover:text-zinc-800"
+        >
+          History
+        </Link>
+        <Link
           href={`/courses/${course.id}/learn`}
           className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-900 px-4 py-2 text-xs font-medium text-white hover:bg-zinc-700 transition-colors"
         >

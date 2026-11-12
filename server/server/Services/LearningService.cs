@@ -221,6 +221,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 Level = topic.DifficultyLevel,
                 StyleLabel = Prompts.StyleLabel(topic.DifficultyLevel),
                 StepNumber = Math.Min(session.StepIndex + 1, totalSteps),
+                CompletedSteps = Math.Min(session.StepIndex, totalSteps),
                 TotalSteps = totalSteps,
                 Reason = session.Reason,
             };
@@ -904,6 +905,87 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         using var r = cmd.ExecuteReader();
         while (r.Read()) texts.Add(r.GetString(0));
         return texts;
+    }
+
+    // ══ History ══════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Past sessions plus per-topic progress and difficulty for the History view.
+    /// Everything is read from the tables written during learning; no LLM call.
+    /// </summary>
+    public HistoryResponse GetHistory(int courseId)
+    {
+        using var conn = db.CreateConnection();
+        var history = new HistoryResponse();
+
+        // ── Sessions, newest first, with simple counts ──
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT s.id, t.title, s.status, s.started_at, s.ended_at,
+                       (SELECT COUNT(*) FROM learn_lessons l WHERE l.session_id = s.id),
+                       (SELECT COUNT(*) FROM learn_quizzes q WHERE q.session_id = s.id AND q.completed_at IS NOT NULL),
+                       (SELECT COUNT(*) FROM learn_quizzes q WHERE q.session_id = s.id AND q.passed = 1)
+                FROM sessions s JOIN topics t ON t.id = s.current_topic_id
+                WHERE s.course_id = $c
+                ORDER BY s.id DESC
+                """;
+            cmd.Parameters.AddWithValue("$c", courseId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                history.Sessions.Add(new SessionHistory
+                {
+                    Id = r.GetInt32(0),
+                    TopicTitle = r.GetString(1),
+                    Status = r.GetString(2),
+                    StartedAt = r.GetString(3),
+                    EndedAt = r.IsDBNull(4) ? null : r.GetString(4),
+                    Lessons = r.GetInt32(5),
+                    Quizzes = r.GetInt32(6),
+                    QuizzesPassed = r.GetInt32(7),
+                });
+        }
+
+        // ── Topics: status, current level, last checkpoint score, level changes ──
+        foreach (var topic in LoadTopics(conn, courseId))
+        {
+            // The topic's own last checkpoint or re-test (not the one or two refresher
+            // questions it may have contributed to another topic's checkpoint).
+            var lastPct = Scalar(conn, """
+                SELECT r.score_pct FROM checkpoint_results r
+                JOIN learn_quizzes q ON q.id = r.quiz_id AND q.topic_id = r.topic_id
+                WHERE r.topic_id = $t ORDER BY r.id DESC LIMIT 1
+                """, ("$t", topic.Id));
+
+            var progress = new TopicProgress
+            {
+                Id = topic.Id,
+                Title = topic.Title,
+                Status = topic.Status,
+                Level = topic.DifficultyLevel,
+                LastCheckpointPct = lastPct is null ? null : Convert.ToInt32(lastPct),
+            };
+
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT old_level, new_level, reason, created_at
+                FROM difficulty_history WHERE topic_id = $t ORDER BY id
+                """;
+            cmd.Parameters.AddWithValue("$t", topic.Id);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                progress.LevelChanges.Add(new LevelChange
+                {
+                    OldLevel = r.GetInt32(0),
+                    NewLevel = r.GetInt32(1),
+                    Reason = r.GetString(2),
+                    At = r.GetString(3),
+                });
+
+            history.Topics.Add(progress);
+        }
+
+        return history;
     }
 
     // ══ Helpers ══════════════════════════════════════════════════════════════
