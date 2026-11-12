@@ -1,0 +1,21 @@
+# ── C# / .NET ─────────────────────────────────────────────────────────────────
+server/server/bin/
+server/server/obj/
+# Contains the real Gemini API key — never commit this
+server/server/appsettings.Development.json
+
+# ── Next.js ───────────────────────────────────────────────────────────────────
+adaptive_tutor/.next/
+adaptive_tutor/node_modules/
+adaptive_tutor/.env*.local
+
+# ── General ───────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.user
+
+# ── Local data (not source) ───────────────────────────────────────────────────
+server/server/adaptive_tutor.db*
+server/server/uploads/
+.idea/
+*.tsbuildinfo
