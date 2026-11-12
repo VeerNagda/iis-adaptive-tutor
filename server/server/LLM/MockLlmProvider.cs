@@ -73,9 +73,11 @@ public sealed class MockLlmProvider : ILlmProvider
     {
         var title = Regex.Match(prompt, "topic \"(.+?)\"").Groups[1].Value;
         bool reteach = prompt.Contains("RE-TEACH:");
+        // Echo the level so the adaptive difficulty is visible even in mock mode.
+        int level = int.Parse(Regex.Match(prompt, @"DIFFICULTY LEVEL: (\d)").Groups[1].Value);
 
         var lessonText =
-            $"(MOCK lesson{(reteach ? ", explained again in a different way" : "")}) "
+            $"(MOCK lesson at level {level}: {Prompts.StyleLabel(level)}{(reteach ? ", explained again in a different way" : "")}) "
             + "A real LLM would explain this part of the topic here. "
             + "The uploaded material for this step begins: \"" + SourceExcerpt(prompt, 60) + "…\"";
 

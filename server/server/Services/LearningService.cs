@@ -188,8 +188,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     //
     //   phase 'lesson' → learner reads the lesson            → Continue()
     //   phase 'quiz'   → learner answers the 3 questions     → SubmitAnswers()
-    //        pass (0 or 1 mistakes) → next step, phase 'lesson'
-    //        fail (2+ mistakes)     → same step, attempt + 1, new simpler lesson and new questions
+    //        pass (0 or 1 mistakes) → next step, phase 'lesson'  (0 mistakes: level + 1)
+    //        fail (2+ mistakes)     → same step, attempt + 1, level - 1, new easier lesson and new questions
     //   phase 'done'   → all steps finished
 
     /// <summary>A topic is taught in at most this many lesson steps.</summary>
@@ -213,7 +213,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 MockMode = MockMode,
                 TopicTitle = topic.Title,
                 Level = topic.DifficultyLevel,
-                StyleLabel = "Standard",
+                StyleLabel = Prompts.StyleLabel(topic.DifficultyLevel),
                 StepNumber = Math.Min(session.StepIndex + 1, totalSteps),
                 TotalSteps = totalSteps,
                 Reason = session.Reason,
@@ -351,8 +351,10 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
 
     /// <summary>
     /// The adaptive branch after a lesson quiz:
-    ///   at most 1 mistake → praise + one insight, go to the next step;
-    ///   otherwise         → teach the same step again, more simply, with new questions.
+    ///   0 mistakes  → clean pass: praise + insight, next step, difficulty level + 1 (max 5);
+    ///   1 mistake   → pass: praise + insight, next step, level unchanged;
+    ///   2+ mistakes → fail: level - 1 (min 1), teach the same step again in the
+    ///                 easier style, with new questions.
     /// </summary>
     private void DecideAfterLessonQuiz(
         SqliteConnection conn, LearnSession session, Topic topic, int quizId, AnswerResult result)
@@ -370,18 +372,43 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 JOIN learn_quizzes q ON q.lesson_id = l.id WHERE q.id = $q
                 """, ("$q", quizId)) as string;
 
+            if (mistakes == 0)
+                ChangeLevel(conn, topic, session.Id, +1, "Passed a lesson quiz with no mistakes");
             AdvanceStep(session, topic);
             session.Reason = null;
             result.Decision = session.Phase == "done" ? "done" : "advance";
         }
         else
         {
+            ChangeLevel(conn, topic, session.Id, -1, $"Failed a lesson quiz ({result.Correct}/{result.Total})");
             session.Attempt++;
             session.Phase = "lesson";
-            session.Reason = $"Re-explained in a simpler way because you missed {mistakes} of {result.Total} questions.";
+            session.Reason = $"Re-explained at an easier level ({topic.DifficultyLevel} of 5: "
+                + $"{Prompts.StyleLabel(topic.DifficultyLevel)}) because you missed {mistakes} of {result.Total} questions.";
             result.Decision = "reteach";
             result.Message = "Not quite there yet. Let's go through this part again in a simpler way, then try new questions.";
         }
+        result.NewLevel = topic.DifficultyLevel;
+    }
+
+    /// <summary>
+    /// Raises or lowers a topic's difficulty level, kept within 1..5. The level
+    /// is stored on the topic (so the next session starts from it) and every
+    /// change is written to difficulty_history with its reason.
+    /// </summary>
+    private static void ChangeLevel(SqliteConnection conn, Topic topic, int sessionId, int delta, string reason)
+    {
+        int oldLevel = topic.DifficultyLevel;
+        int newLevel = Math.Clamp(oldLevel + delta, 1, 5);
+        if (newLevel == oldLevel) return;   // already at the limit
+
+        topic.DifficultyLevel = newLevel;
+        Exec(conn, "UPDATE topics SET difficulty_level = $l WHERE id = $t", ("$l", newLevel), ("$t", topic.Id));
+        Exec(conn, """
+            INSERT INTO difficulty_history (topic_id, session_id, old_level, new_level, reason)
+            VALUES ($t, $s, $old, $new, $reason)
+            """,
+            ("$t", topic.Id), ("$s", sessionId), ("$old", oldLevel), ("$new", newLevel), ("$reason", reason));
     }
 
     /// <summary>Moves the session to the next lesson step, or finishes the topic.</summary>
@@ -437,9 +464,9 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             if (previous is not null) missed = LoadMissedQuestions(conn, previous.QuizId);
         }
 
-        var style = session.Attempt == 1 ? Prompts.StandardStyle : Prompts.SimplerStyle;
+        // The topic's current level picks the teaching style (see Prompts.StyleForLevel).
         var reply = await AskAsync<LlmLesson>(
-            Prompts.Lesson(topic.Title, source, style, previousText, missed), ct);
+            Prompts.Lesson(topic.Title, source, topic.DifficultyLevel, previousText, missed), ct);
 
         var questions = ValidQuestions(reply.Questions).Take(Prompts.QuizSize).ToList();
         if (string.IsNullOrWhiteSpace(reply.LessonText) || questions.Count < 2)

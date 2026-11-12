@@ -22,13 +22,37 @@ public static class Prompts
     /// <summary>Questions per lesson quiz. Pass = at most one mistake (see LearningService).</summary>
     public const int QuizSize = 3;
 
-    // ── Teaching styles ───────────────────────────────────────────────────────
-    public const string StandardStyle =
-        "Standard explanation: clear, complete sentences, define each key term once, about 150 words.";
+    // ── Adaptive difficulty: level → teaching style ───────────────────────────
+    // Each topic has a difficulty level from 1 (easiest) to 5 (hardest). The
+    // level itself is changed by plain C# rules in LearningService; here it is
+    // only translated into explicit instructions for the LLM, so "level 2"
+    // always means the same thing and can be read off this table.
+    public static string StyleForLevel(int level) => level switch
+    {
+        1 => "Very simple. Plain everyday words, no jargon. Very short sentences. Go step by step in "
+           + "small numbered steps. Use one analogy from daily life and two tiny examples. About 120 words. "
+           + "Quiz questions: direct recall of a single idea, with clearly different options.",
+        2 => "Simple. Mostly plain language; introduce at most two technical terms and explain each in "
+           + "brackets. Short sentences, small steps, one analogy and one worked example. About 130 words. "
+           + "Quiz questions: recall and simple understanding.",
+        3 => "Standard explanation. Clear, complete sentences. Define each key term once. One concrete "
+           + "example. About 150 words. Quiz questions: understanding, not just recall.",
+        4 => "Advanced. Assume the basics are known. Use the correct technical terms, explain why things "
+           + "work and how the ideas connect. About 160 words. Quiz questions: apply the idea to a new situation.",
+        _ => "Expert. Concise and technical. Focus on precise definitions, trade-offs, limits and edge "
+           + "cases; no basic analogies. About 150 words. Quiz questions: edge cases and comparing close "
+           + "alternatives, with subtle wrong options.",
+    };
 
-    public const string SimplerStyle =
-        "Simpler explanation: plain everyday language, short sentences, small steps, "
-        + "one analogy from daily life and one worked example, about 120 words.";
+    /// <summary>Short name of each level, shown in the UI next to the level number.</summary>
+    public static string StyleLabel(int level) => level switch
+    {
+        1 => "Very simple",
+        2 => "Simple",
+        3 => "Standard",
+        4 => "Advanced",
+        _ => "Expert",
+    };
 
     // ── Ingestion: group a document's chunks into learning sections ───────────
     public static string Sections(string chunkSummary) => $$"""
@@ -74,11 +98,11 @@ public static class Prompts
     //   - half the API calls (cost, speed, fewer points of failure).
     //
     // source         text of the uploaded material for this step (the only allowed facts)
-    // style          teaching-style instructions (see the styles above)
+    // level          difficulty 1-5, turned into style instructions by StyleForLevel
     // previousLesson set on a re-teach: the explanation that did not work
     // missed         set on a re-teach: the questions the learner got wrong
     public static string Lesson(
-        string topicTitle, string source, string style,
+        string topicTitle, string source, int level,
         string? previousLesson = null, IReadOnlyList<string>? missed = null)
     {
         // Only added when the same step is taught again.
@@ -99,8 +123,9 @@ public static class Prompts
             GROUNDING: use only facts found in SOURCE below. Do not add outside knowledge.
             If SOURCE does not cover something, leave it out.
 
-            TEACHING STYLE (follow closely):
-            {{style}}
+            DIFFICULTY LEVEL: {{level}} of 5 (1 = easiest, 5 = hardest)
+            TEACHING STYLE for this level (follow closely):
+            {{StyleForLevel(level)}}
             {{reteach}}
 
             After the lesson, write {{QuizSize}} multiple-choice questions that can be answered
