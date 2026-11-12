@@ -103,8 +103,155 @@ public static class DatabaseInitializer
                 )
                 """);
 
+        // ══ Adaptive teaching ("Start Learning") ══════════════════════════════
+        // The existing topics and sessions tables are reused with extra columns.
+        // The older lessons/assessments/messages tables from schema.sql are left
+        // untouched and unused: their CHECK constraints (levels 1-3, concept_id
+        // NOT NULL) do not fit the 1-5 difficulty model, and SQLite cannot alter
+        // a CHECK constraint without rebuilding the table.
+
+        // ── topics: where the content comes from + the learner's state ────────
+        // chunk_ids        JSON array of chunks.id that this topic is taught from
+        // difficulty_level 1 (easiest) .. 5 (hardest); starts at 3, remembered across sessions
+        // status           new | learning | completed | weak
+        if (!ColExists("topics", "chunk_ids"))
+            Exec("ALTER TABLE topics ADD COLUMN chunk_ids TEXT");
+        if (!ColExists("topics", "difficulty_level"))
+            Exec("ALTER TABLE topics ADD COLUMN difficulty_level INTEGER NOT NULL DEFAULT 3");
+        if (!ColExists("topics", "status"))
+            Exec("ALTER TABLE topics ADD COLUMN status TEXT NOT NULL DEFAULT 'new'");
+
+        // ── sessions: position in the lesson loop (one session = one topic) ───
+        // phase            lesson | quiz | checkpoint | review | retest | done
+        // step_index       0-based lesson step within the topic
+        // attempt          1 = first explanation of this step, 2+ = re-teach
+        // since_checkpoint lessons completed since the last checkpoint test
+        // checkpoint_every 3 or 4 (picked at random after each checkpoint)
+        // checkpoint_from  first step covered by the next checkpoint
+        // review_round     0 = not in review, 1-2 = weak-topic review round
+        // reason           why the current content is shown (transparency label)
+        if (!ColExists("sessions", "phase"))
+            Exec("ALTER TABLE sessions ADD COLUMN phase TEXT NOT NULL DEFAULT 'lesson'");
+        if (!ColExists("sessions", "step_index"))
+            Exec("ALTER TABLE sessions ADD COLUMN step_index INTEGER NOT NULL DEFAULT 0");
+        if (!ColExists("sessions", "attempt"))
+            Exec("ALTER TABLE sessions ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1");
+        if (!ColExists("sessions", "since_checkpoint"))
+            Exec("ALTER TABLE sessions ADD COLUMN since_checkpoint INTEGER NOT NULL DEFAULT 0");
+        if (!ColExists("sessions", "checkpoint_every"))
+            Exec("ALTER TABLE sessions ADD COLUMN checkpoint_every INTEGER NOT NULL DEFAULT 3");
+        if (!ColExists("sessions", "checkpoint_from"))
+            Exec("ALTER TABLE sessions ADD COLUMN checkpoint_from INTEGER NOT NULL DEFAULT 0");
+        if (!ColExists("sessions", "review_round"))
+            Exec("ALTER TABLE sessions ADD COLUMN review_round INTEGER NOT NULL DEFAULT 0");
+        if (!ColExists("sessions", "reason"))
+            Exec("ALTER TABLE sessions ADD COLUMN reason TEXT");
+
+        // ── learn_lessons: every lesson text shown to the learner ─────────────
+        // kind = 'lesson' (normal step) or 'review' (weak-topic re-teach after a checkpoint)
+        if (!TableExists("learn_lessons"))
+            Exec("""
+                CREATE TABLE learn_lessons (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id  INTEGER NOT NULL,
+                    topic_id    INTEGER NOT NULL,
+                    kind        TEXT    NOT NULL DEFAULT 'lesson',
+                    step_index  INTEGER NOT NULL,
+                    attempt     INTEGER NOT NULL,
+                    level       INTEGER NOT NULL,
+                    text        TEXT    NOT NULL,
+                    example     TEXT,
+                    insight     TEXT,
+                    reason      TEXT,
+                    created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                    FOREIGN KEY (topic_id)   REFERENCES topics(id)   ON DELETE CASCADE
+                )
+                """);
+
+        // ── learn_quizzes: one row per quiz taken ─────────────────────────────
+        // kind = 'lesson' (after a lesson), 'checkpoint' (mixed test), 'retest' (after a review)
+        // correct/passed stay NULL until the learner submits answers.
+        if (!TableExists("learn_quizzes"))
+            Exec("""
+                CREATE TABLE learn_quizzes (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id   INTEGER NOT NULL,
+                    topic_id     INTEGER NOT NULL,
+                    lesson_id    INTEGER,
+                    kind         TEXT    NOT NULL,
+                    total        INTEGER NOT NULL,
+                    correct      INTEGER,
+                    passed       INTEGER,
+                    simulated    INTEGER NOT NULL DEFAULT 0,
+                    created_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TEXT,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id)      ON DELETE CASCADE,
+                    FOREIGN KEY (topic_id)   REFERENCES topics(id)        ON DELETE CASCADE,
+                    FOREIGN KEY (lesson_id)  REFERENCES learn_lessons(id) ON DELETE CASCADE
+                )
+                """);
+
+        // ── learn_questions: quiz questions plus the learner's answer ─────────
+        // topic_id is per question because a checkpoint mixes several topics.
+        if (!TableExists("learn_questions"))
+            Exec("""
+                CREATE TABLE learn_questions (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    quiz_id       INTEGER NOT NULL,
+                    topic_id      INTEGER NOT NULL,
+                    text          TEXT    NOT NULL,
+                    options       TEXT    NOT NULL,
+                    correct_index INTEGER NOT NULL,
+                    explanation   TEXT,
+                    label         TEXT,
+                    user_answer   INTEGER,
+                    is_correct    INTEGER,
+                    FOREIGN KEY (quiz_id)  REFERENCES learn_quizzes(id) ON DELETE CASCADE,
+                    FOREIGN KEY (topic_id) REFERENCES topics(id)        ON DELETE CASCADE
+                )
+                """);
+
+        // ── difficulty_history: every level change, with the reason ───────────
+        if (!TableExists("difficulty_history"))
+            Exec("""
+                CREATE TABLE difficulty_history (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    topic_id   INTEGER NOT NULL,
+                    session_id INTEGER,
+                    old_level  INTEGER NOT NULL,
+                    new_level  INTEGER NOT NULL,
+                    reason     TEXT    NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (topic_id)   REFERENCES topics(id)   ON DELETE CASCADE,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE SET NULL
+                )
+                """);
+
+        // ── checkpoint_results: score per topic for each checkpoint / re-test ─
+        if (!TableExists("checkpoint_results"))
+            Exec("""
+                CREATE TABLE checkpoint_results (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    quiz_id    INTEGER NOT NULL,
+                    session_id INTEGER NOT NULL,
+                    topic_id   INTEGER NOT NULL,
+                    correct    INTEGER NOT NULL,
+                    total      INTEGER NOT NULL,
+                    score_pct  INTEGER NOT NULL,
+                    is_weak    INTEGER NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (quiz_id)    REFERENCES learn_quizzes(id) ON DELETE CASCADE,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id)      ON DELETE CASCADE,
+                    FOREIGN KEY (topic_id)   REFERENCES topics(id)        ON DELETE CASCADE
+                )
+                """);
+
         // ── indexes (IF NOT EXISTS is safe for indexes) ───────────────────────
         Exec("CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id, chunk_index)");
         Exec("CREATE INDEX IF NOT EXISTS idx_sections_document ON document_sections(document_id, section_index)");
+        Exec("CREATE INDEX IF NOT EXISTS idx_learn_lessons_session ON learn_lessons(session_id, kind, step_index, attempt)");
+        Exec("CREATE INDEX IF NOT EXISTS idx_learn_quizzes_session ON learn_quizzes(session_id)");
+        Exec("CREATE INDEX IF NOT EXISTS idx_learn_questions_quiz ON learn_questions(quiz_id)");
     }
 }
