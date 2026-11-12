@@ -17,6 +17,18 @@ public static class Prompts
 {
     public const string SectionsTask = "[[TASK:SECTIONS]]";
     public const string TopicsTask = "[[TASK:TOPICS]]";
+    public const string LessonTask = "[[TASK:LESSON]]";
+
+    /// <summary>Questions per lesson quiz. Pass = at most one mistake (see LearningService).</summary>
+    public const int QuizSize = 3;
+
+    // ── Teaching styles ───────────────────────────────────────────────────────
+    public const string StandardStyle =
+        "Standard explanation: clear, complete sentences, define each key term once, about 150 words.";
+
+    public const string SimplerStyle =
+        "Simpler explanation: plain everyday language, short sentences, small steps, "
+        + "one analogy from daily life and one worked example, about 120 words.";
 
     // ── Ingestion: group a document's chunks into learning sections ───────────
     public static string Sections(string chunkSummary) => $$"""
@@ -54,4 +66,57 @@ public static class Prompts
         SECTIONS:
         {{sectionList}}
         """;
+
+    // ── Lesson + quiz for one lesson step ─────────────────────────────────────
+    // One call returns the lesson AND its quiz. Reasons for a single call:
+    //   - the questions are written against the exact lesson text the learner
+    //     sees, so they are always answerable from it;
+    //   - half the API calls (cost, speed, fewer points of failure).
+    //
+    // source         text of the uploaded material for this step (the only allowed facts)
+    // style          teaching-style instructions (see the styles above)
+    // previousLesson set on a re-teach: the explanation that did not work
+    // missed         set on a re-teach: the questions the learner got wrong
+    public static string Lesson(
+        string topicTitle, string source, string style,
+        string? previousLesson = null, IReadOnlyList<string>? missed = null)
+    {
+        // Only added when the same step is taught again.
+        var missedList = missed is { Count: > 0 } ? string.Join(" | ", missed) : "none recorded";
+        var reteach = previousLesson is null ? "" : $"""
+
+            RE-TEACH: the learner has already seen the explanation below and it did not work.
+            Explain the same content again in a clearly different way (new wording, new example).
+            Questions they got wrong (focus on these ideas): {missedList}
+            Write NEW quiz questions; do not repeat or lightly reword the earlier ones.
+            PREVIOUS EXPLANATION: {previousLesson}
+            """;
+
+        return $$"""
+            {{LessonTask}}
+            You are a patient tutor. Teach ONE short lesson that is part of the topic "{{topicTitle}}".
+
+            GROUNDING: use only facts found in SOURCE below. Do not add outside knowledge.
+            If SOURCE does not cover something, leave it out.
+
+            TEACHING STYLE (follow closely):
+            {{style}}
+            {{reteach}}
+
+            After the lesson, write {{QuizSize}} multiple-choice questions that can be answered
+            from your lesson_text alone. Each question has 4 options with exactly one correct,
+            plausible wrong options, and a 1-2 sentence explanation of why the answer is right.
+
+            Return JSON only, in exactly this shape:
+            {"lesson_text":"the lesson",
+             "example":"one concrete example or analogy",
+             "insight":"one sentence: an extra interesting point from SOURCE that goes slightly beyond the lesson",
+             "questions":[{"text":"...","options":["...","...","...","..."],"correct_index":0,"explanation":"..."}]}
+            correct_index is the 0-based position of the correct option; vary it between questions.
+
+            <<<SOURCE
+            {{source}}
+            SOURCE>>>
+            """;
+    }
 }

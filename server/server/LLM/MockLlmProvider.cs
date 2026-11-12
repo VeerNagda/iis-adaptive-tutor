@@ -20,6 +20,7 @@ public sealed class MockLlmProvider : ILlmProvider
         string json =
             prompt.Contains(Prompts.SectionsTask) ? MockSections(prompt) :
             prompt.Contains(Prompts.TopicsTask) ? MockTopics(prompt) :
+            prompt.Contains(Prompts.LessonTask) ? MockLesson(prompt) :
             """{"error":"MockLlmProvider: unrecognised task marker."}""";
 
         return Task.FromResult(json);
@@ -64,5 +65,55 @@ public sealed class MockLlmProvider : ILlmProvider
         });
 
         return JsonSerializer.Serialize(new { topics });
+    }
+
+    // ── Lesson + quiz: quotes the start of the real source text so the mock is
+    //    visibly tied to the uploaded material; the quiz questions are canned ──
+    private static string MockLesson(string prompt)
+    {
+        var title = Regex.Match(prompt, "topic \"(.+?)\"").Groups[1].Value;
+        bool reteach = prompt.Contains("RE-TEACH:");
+
+        var lessonText =
+            $"(MOCK lesson{(reteach ? ", explained again in a different way" : "")}) "
+            + "A real LLM would explain this part of the topic here. "
+            + "The uploaded material for this step begins: \"" + SourceExcerpt(prompt, 60) + "…\"";
+
+        return JsonSerializer.Serialize(new
+        {
+            lesson_text = lessonText,
+            example = "(MOCK example) A real LLM would give one concrete example or analogy here.",
+            insight = "(MOCK insight) A real LLM would add one extra interesting point from the material.",
+            questions = MockQuestions(title, Prompts.QuizSize)
+        });
+    }
+
+    /// <summary>First few words of the text between the SOURCE markers of a prompt.</summary>
+    private static string SourceExcerpt(string prompt, int words)
+    {
+        var source = Regex.Match(prompt, @"<<<SOURCE\s*(.*?)\s*SOURCE>>>", RegexOptions.Singleline).Groups[1].Value;
+        return string.Join(" ", source.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Take(words));
+    }
+
+    /// <summary>
+    /// Canned questions. A random set number makes every quiz "new" (as a real
+    /// re-quiz would be), and the correct option moves between questions.
+    /// </summary>
+    private static object[] MockQuestions(string title, int count)
+    {
+        int set = Random.Shared.Next(100, 999);
+        return Enumerable.Range(0, count).Select(i =>
+        {
+            int correct = (i + 1) % 4;
+            return (object)new
+            {
+                text = $"(MOCK question {i + 1}, set {set}) Which option is the correct one for \"{title}\"?",
+                options = Enumerable.Range(0, 4)
+                    .Select(o => o == correct ? "The correct answer" : $"A wrong answer ({(char)('A' + o)})")
+                    .ToArray(),
+                correct_index = correct,
+                explanation = "(MOCK explanation) A real LLM would explain here why this option is right."
+            };
+        }).ToArray();
     }
 }
