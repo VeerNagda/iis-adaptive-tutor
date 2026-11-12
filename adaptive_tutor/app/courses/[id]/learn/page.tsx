@@ -17,12 +17,17 @@ type Topic = {
   difficultyLevel: number; // 1 (easiest) .. 5 (hardest)
   status: "new" | "learning" | "completed" | "weak";
 };
-type TopicList = { mockMode: boolean; hasContent: boolean; topics: Topic[] };
+type TopicList = {
+  mockMode: boolean;
+  hasContent: boolean;
+  newTopics: number; // topics just added from newly ingested files
+  topics: Topic[];
+};
 
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5242";
 
 const DOC_STATUS: Record<string, { label: string; cls: string }> = {
-  pending: { label: "Waiting for ingestion", cls: "text-zinc-400" },
+  pending: { label: "Not ingested yet", cls: "text-zinc-400" },
   processing: { label: "Processing…", cls: "text-blue-500" },
   completed: { label: "Ready", cls: "text-green-600" },
   failed: { label: "Ingestion failed", cls: "text-red-500" },
@@ -37,9 +42,10 @@ const TOPIC_STATUS: Record<Topic["status"], { label: string; cls: string; action
 
 // ─── Materials: the uploaded files the topics are extracted from ─────────────
 
-function MaterialsPanel({ courseId }: { courseId: string }) {
+function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested: () => void }) {
   const [docs, setDocs] = useState<Document[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [ingestingId, setIngestingId] = useState<number | null>(null);
   const [error, setError] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -69,6 +75,21 @@ function MaterialsPanel({ courseId }: { courseId: string }) {
     await fetchDocs();
     setUploading(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  // Ingestion is started by hand (it uses the LLM). When it succeeds, the topic
+  // list is reloaded so the new file's topics appear.
+  async function handleIngest(docId: number) {
+    setIngestingId(docId);
+    setError("");
+    try {
+      await apiService.post(`/courses/${courseId}/documents/${docId}/ingest`, {});
+      onIngested();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Ingestion failed.");
+    }
+    await fetchDocs();
+    setIngestingId(null);
   }
 
   async function handleRemove(docId: number) {
@@ -116,8 +137,19 @@ function MaterialsPanel({ courseId }: { courseId: string }) {
                 </span>
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm text-zinc-700" title={doc.filename}>{doc.filename}</p>
-                  <p className={`text-xs ${status.cls}`}>{status.label}</p>
+                  <p className={`text-xs ${status.cls}`}>
+                    {ingestingId === doc.id ? "Ingesting… this can take a minute" : status.label}
+                  </p>
                 </div>
+                {doc.processingStatus !== "completed" && (
+                  <button
+                    onClick={() => handleIngest(doc.id)}
+                    disabled={ingestingId !== null}
+                    className="shrink-0 rounded border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+                  >
+                    {doc.processingStatus === "pending" ? "Ingest" : "Retry"}
+                  </button>
+                )}
                 <button
                   onClick={() => handleRemove(doc.id)}
                   className="shrink-0 rounded px-2 py-1 text-xs text-zinc-400 hover:bg-red-50 hover:text-red-500"
@@ -187,6 +219,12 @@ function TopicsPanel({ courseId, onMockMode }: { courseId: string; onMockMode: (
 
       {loading && <p className="text-sm text-zinc-500">Finding topics in your materials…</p>}
 
+      {!loading && !error && data && data.newTopics > 0 && (
+        <p className="mb-3 rounded-lg border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
+          {data.newTopics} new {data.newTopics === 1 ? "topic was" : "topics were"} added from newly ingested files (at the end of the list).
+        </p>
+      )}
+
       {error && (
         <div className="rounded-lg bg-red-50 px-4 py-3 text-sm text-red-600">
           <p>{error}</p>
@@ -198,7 +236,7 @@ function TopicsPanel({ courseId, onMockMode }: { courseId: string; onMockMode: (
 
       {!loading && !error && data && !data.hasContent && (
         <p className="text-sm text-zinc-500">
-          No ingested material yet. Upload a file and wait until it shows “Ready”, then reload this page.
+          No ingested material yet. Add a file under Materials and click “Ingest”.
         </p>
       )}
 
@@ -251,6 +289,8 @@ function LearnContent() {
   const { id } = useParams<{ id: string }>();
   const [course, setCourse] = useState<Course | null>(null);
   const [mockMode, setMockMode] = useState(false);
+  // Increased after a file is ingested: remounts the topics panel so it reloads.
+  const [topicsVersion, setTopicsVersion] = useState(0);
 
   useEffect(() => {
     apiService.get<Course>(`/courses/${id}`).then(setCourse).catch(() => {});
@@ -277,10 +317,10 @@ function LearnContent() {
 
       <main className="mx-auto grid max-w-6xl grid-cols-1 gap-6 px-6 py-8 lg:grid-cols-3">
         <div className="lg:col-span-2">
-          <TopicsPanel courseId={id} onMockMode={setMockMode} />
+          <TopicsPanel key={topicsVersion} courseId={id} onMockMode={setMockMode} />
         </div>
         <div>
-          <MaterialsPanel courseId={id} />
+          <MaterialsPanel courseId={id} onIngested={() => setTopicsVersion((v) => v + 1)} />
         </div>
       </main>
     </div>

@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS documents (
     processing_status TEXT DEFAULT 'pending'
         CHECK (processing_status IN ('pending', 'processing', 'completed', 'failed')),
     error_message     TEXT,
+    topics_extracted  INTEGER NOT NULL DEFAULT 0,   -- 1 once the document's sections were turned into topics
     uploaded_at       TEXT DEFAULT CURRENT_TIMESTAMP,
     deleted_at        TEXT,
     FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE

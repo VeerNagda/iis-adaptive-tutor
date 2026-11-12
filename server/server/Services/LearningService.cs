@@ -27,9 +27,11 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     // ══ Topics ═══════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// Returns the course's topics. The first call extracts them with the LLM
-    /// from the ingested sections and caches them in the topics table; later
-    /// calls only read the table.
+    /// Returns the course's topics, which are cached in the topics table.
+    /// The LLM is only called when there are documents that were ingested but not
+    /// yet turned into topics: on the very first call that is every document, later
+    /// it is only newly added ones, whose topics are appended to the list. Existing
+    /// topics (and the learner's progress on them) are never touched.
     /// </summary>
     public async Task<TopicListResponse> GetTopicsAsync(int courseId, CancellationToken ct)
     {
@@ -37,24 +39,35 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         try
         {
             using var conn = db.CreateConnection();
-            var sections = LoadSections(conn, courseId);
-            var topics = LoadTopics(conn, courseId);
+            bool hasContent = LoadSections(conn, courseId, onlyNew: false).Count > 0;
+            var newSections = LoadSections(conn, courseId, onlyNew: true);
+            int existingTopics = LoadTopics(conn, courseId).Count;
+            int added = 0;
 
-            if (topics.Count == 0 && sections.Count > 0)
+            if (newSections.Count > 0)
             {
-                log.LogInformation("Extracting topics for course {Id} from {N} sections", courseId, sections.Count);
+                log.LogInformation("Extracting topics for course {Id} from {N} new sections", courseId, newSections.Count);
 
                 var sectionList = string.Join("\n",
-                    sections.Select(s => $"[S{s.Id}] {s.Title} — {s.Summary}"));
+                    newSections.Select(s => $"[S{s.Id}] {s.Title} — {s.Summary}"));
                 var reply = await AskAsync<LlmTopicList>(Prompts.Topics(sectionList), ct);
 
-                SaveTopics(conn, courseId, reply.Topics, sections);
-                topics = LoadTopics(conn, courseId);
-                if (topics.Count == 0)
+                added = SaveTopics(conn, courseId, reply.Topics, newSections);
+                if (added == 0 && existingTopics == 0)
                     throw new LlmException("The AI returned no usable topics. Please retry.");
+
+                // Remember that these documents are done, so the next page load is a plain read.
+                foreach (var documentId in newSections.Select(s => s.DocumentId).Distinct())
+                    Exec(conn, "UPDATE documents SET topics_extracted = 1 WHERE id = $d", ("$d", documentId));
             }
 
-            return new TopicListResponse { MockMode = MockMode, HasContent = sections.Count > 0, Topics = topics };
+            return new TopicListResponse
+            {
+                MockMode = MockMode,
+                HasContent = hasContent,
+                NewTopics = existingTopics > 0 ? added : 0,   // the first extraction is not "new topics"
+                Topics = LoadTopics(conn, courseId),
+            };
         }
         finally
         {
@@ -90,8 +103,11 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
 
     private sealed record SectionRow(int Id, int DocumentId, string Title, string Summary, List<int> ChunkIndexes);
 
-    /// <summary>Sections of the course's successfully ingested, non-deleted documents.</summary>
-    private static List<SectionRow> LoadSections(SqliteConnection conn, int courseId)
+    /// <summary>
+    /// Sections of the course's successfully ingested, non-deleted documents.
+    /// onlyNew = only documents that have not been turned into topics yet.
+    /// </summary>
+    private static List<SectionRow> LoadSections(SqliteConnection conn, int courseId, bool onlyNew)
     {
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
@@ -99,9 +115,11 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             FROM document_sections s
             JOIN documents d ON d.id = s.document_id
             WHERE d.course_id = $c AND d.deleted_at IS NULL AND d.processing_status = 'completed'
+              AND ($onlyNew = 0 OR d.topics_extracted = 0)
             ORDER BY s.document_id, s.section_index
             """;
         cmd.Parameters.AddWithValue("$c", courseId);
+        cmd.Parameters.AddWithValue("$onlyNew", onlyNew ? 1 : 0);
 
         var rows = new List<SectionRow>();
         using var r = cmd.ExecuteReader();
@@ -145,12 +163,15 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     /// <summary>
     /// Stores the LLM's topics. The LLM only names section ids; here they are
     /// checked against the real sections and translated into chunk ids, so a
-    /// topic can never point at content that does not exist.
+    /// topic can never point at content that does not exist. New topics are
+    /// numbered after the existing ones. Returns how many topics were stored.
     /// </summary>
-    private static void SaveTopics(SqliteConnection conn, int courseId, List<LlmTopic> llmTopics, List<SectionRow> sections)
+    private static int SaveTopics(SqliteConnection conn, int courseId, List<LlmTopic> llmTopics, List<SectionRow> sections)
     {
         using var tx = conn.BeginTransaction();
-        int sequence = 1;
+        int sequence = 1 + Convert.ToInt32(Scalar(conn,
+            "SELECT COALESCE(MAX(sequence_number), 0) FROM topics WHERE course_id = $c", ("$c", courseId)));
+        int added = 0;
 
         foreach (var t in llmTopics)
         {
@@ -175,9 +196,11 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 """,
                 ("$c", courseId), ("$title", t.Title.Trim()), ("$summary", t.Summary.Trim()),
                 ("$seq", sequence++), ("$chunks", JsonSerializer.Serialize(chunkIds.Distinct())));
+            added++;
         }
 
         tx.Commit();
+        return added;
     }
 
     // ══ Lesson loop ══════════════════════════════════════════════════════════

@@ -1,12 +1,13 @@
 using Microsoft.AspNetCore.Mvc;
 using server.Data;
 using server.Models;
+using server.Services;
 
 namespace server.Controllers;
 
 [ApiController]
 [Route("courses/{courseId:int}/documents")]
-public class DocumentsController(IDbConnectionFactory db, IConfiguration config) : ControllerBase
+public class DocumentsController(IDbConnectionFactory db, IConfiguration config, IngestionService ingestion) : ControllerBase
 {
     private static readonly HashSet<string> AllowedExtensions = [".pdf", ".pptx", ".docx"];
 
@@ -96,6 +97,42 @@ public class DocumentsController(IDbConnectionFactory db, IConfiguration config)
             ProcessingStatus = reader.GetString(5),
             UploadedAt = reader.GetString(6),
         });
+    }
+
+    /// <summary>
+    /// Ingests one uploaded document now (extract text, chunk, sections, embeddings).
+    /// Ingestion is started by hand from the UI instead of a background poller, so
+    /// LLM quota is only spent when the user asks for it. Once a document is
+    /// ingested, its topics are added the next time the topics list is loaded.
+    /// </summary>
+    [HttpPost("{docId:int}/ingest")]
+    public async Task<IActionResult> Ingest(int courseId, int docId, CancellationToken ct)
+    {
+        using (var conn = db.CreateConnection())
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT processing_status FROM documents
+                WHERE id = $docId AND course_id = $courseId AND deleted_at IS NULL;
+                """;
+            cmd.Parameters.AddWithValue("$docId", docId);
+            cmd.Parameters.AddWithValue("$courseId", courseId);
+            var status = cmd.ExecuteScalar() as string;
+            if (status is null) return NotFound("Document not found.");
+            if (status == "completed") return NoContent();   // nothing to do
+        }
+
+        try
+        {
+            await ingestion.IngestAsync(docId, ct);
+            return NoContent();
+        }
+        catch (Exception ex)
+        {
+            // IngestAsync has already stored the failure on the document row.
+            var message = ex.Message.Length > 300 ? ex.Message[..300] + "…" : ex.Message;
+            return StatusCode(502, $"Ingestion failed: {message}");
+        }
     }
 
     [HttpDelete("{docId:int}")]

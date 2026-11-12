@@ -93,6 +93,13 @@ public static class DatabaseInitializer
         AddColumn(connection, "topics", "difficulty_level", "INTEGER NOT NULL DEFAULT 3");
         AddColumn(connection, "topics", "status", "TEXT NOT NULL DEFAULT 'new'");
         AddColumn(connection, "learn_questions", "option_feedback", "TEXT");
+
+        // Documents whose topics already exist must not be extracted a second time.
+        if (AddColumn(connection, "documents", "topics_extracted", "INTEGER NOT NULL DEFAULT 0"))
+            Exec(connection, """
+                UPDATE documents SET topics_extracted = 1
+                WHERE processing_status = 'completed' AND course_id IN (SELECT course_id FROM topics)
+                """);
     }
 
     /// <summary>Adds a column if the table does not have it yet. Returns true if it was added.</summary>

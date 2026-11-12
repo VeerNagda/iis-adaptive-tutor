@@ -87,6 +87,8 @@ public class TopicListResponse
     public bool MockMode { get; set; }
     /// <summary>False when no document of the course has been ingested yet.</summary>
     public bool HasContent { get; set; }
+    /// <summary>How many topics this call added from newly ingested documents.</summary>
+    public int NewTopics { get; set; }
     public List<Topic> Topics { get; set; } = [];
 }
 
