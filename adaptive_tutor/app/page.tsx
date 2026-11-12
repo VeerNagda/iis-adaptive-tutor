@@ -36,13 +36,10 @@ function CourseCard({ course }: { course: Course }) {
       <div className="flex items-center justify-between gap-3">
         <span className="text-xs text-zinc-400">{formatDate(course.createdAt)}</span>
         <Link
-          href={`/courses/${course.id}/chat`}
+          href={`/courses/${course.id}/learn`}
           className="inline-flex items-center gap-1.5 rounded-lg bg-zinc-900 px-4 py-2 text-xs font-medium text-white hover:bg-zinc-700 transition-colors"
         >
-          <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-          </svg>
-          Open chat
+          Start Learning
         </Link>
       </div>
     </div>

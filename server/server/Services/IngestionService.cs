@@ -198,21 +198,8 @@ public sealed class IngestionService(
             chunks.Select((c, i) =>
                 $"[Chunk {i}] p.{c.PageStart}  {c.Text[..Math.Min(c.Text.Length, 400)]}"));
 
-        // $$""" lets us use {{ }} as literal braces in the JSON example while still
-        // interpolating {{chunkSummary}} with double-braces for the variable.
-        var prompt = $$"""
-            SECTION_SPLIT
-            You are an educational content designer.
-            Given these numbered text chunks from a study document, group them into 4–8 learning
-            sections ordered from foundational to advanced.
-            For each section provide:
-              title (clear heading), summary (2 sentences), key_concepts (3-6 concept names),
-              difficulty (1=introductory, 2=intermediate, 3=advanced),
-              chunk_indexes (0-based list covering every chunk — no chunk may be unassigned).
-            Return JSON with a "sections" array where each object has the five fields above.
-
-            {{chunkSummary}}
-            """;
+        // All prompts live in LLM/Prompts.cs so they can be inspected in one place.
+        var prompt = Prompts.Sections(chunkSummary);
 
         // Retry once only on JSON parse failures (bad schema from the model).
         // HTTP errors (429, 503, etc.) are already retried with backoff inside GeminiProvider

@@ -8,7 +8,7 @@ namespace server.LLM;
 /// Docs: https://ai.google.dev/api/generate-content
 ///
 /// Config keys (appsettings):
-///   GeminiAPI:APIKEY  — secret key (keep out of source control; use appsettings.Development.json or env var)
+///   GEMINI_API_KEY    — environment variable holding the secret key (see LlmKey; never committed)
 ///   GeminiAPI:Model   — model ID; defaults to gemini-3.8-flash (current general-purpose workhorse)
 ///
 /// Every prompt asks for JSON output via responseMimeType so the caller
@@ -20,9 +20,11 @@ namespace server.LLM;
 public sealed class GeminiProvider(HttpClient http, IConfiguration config, ILogger<GeminiProvider> log)
     : ILlmProvider
 {
-    private readonly string _apiKey = config["GeminiAPI:APIKEY"]
+    private readonly string _apiKey = LlmKey.Read(config)
         ?? throw new InvalidOperationException(
-            "GeminiAPI:APIKEY is missing. Add it to appsettings.Development.json or set the env var.");
+            "No Gemini API key. Set the GEMINI_API_KEY environment variable.");
+
+    public bool IsMock => false;
 
     private readonly string _model = config["GeminiAPI:Model"] ?? "gemini-3.8-flash";
 

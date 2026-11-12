@@ -21,9 +21,9 @@ namespace server.LLM;
 public sealed class GeminiEmbedder(HttpClient http, IConfiguration config, ILogger<GeminiEmbedder> log)
     : IGeminiEmbedder
 {
-    private readonly string _apiKey = config["GeminiAPI:APIKEY"]
+    private readonly string _apiKey = LlmKey.Read(config)
         ?? throw new InvalidOperationException(
-            "GeminiAPI:APIKEY is missing. Add it to appsettings.Development.json.");
+            "No Gemini API key. Set the GEMINI_API_KEY environment variable.");
 
     private const string EmbedModel = "models/gemini-embedding-001";
     private static readonly int[] RetryDelaysMs = [1_000, 2_000, 4_000, 8_000];

@@ -19,10 +19,14 @@ var connectionString = builder.Configuration.GetConnectionString("Sqlite")
 builder.Services.AddSingleton<IDbConnectionFactory>(
     new SqliteConnectionFactory(connectionString));
 
-// Register whichever LLM provider is selected in config (default: Mock).
-// Set LlmProvider=Gemini in appsettings.Development.json to use the real API.
-var llmProvider = builder.Configuration["LlmProvider"] ?? "Mock";
-if (llmProvider.Equals("Gemini", StringComparison.OrdinalIgnoreCase))
+// Choose the LLM provider:
+//   - Gemini when an API key is available (env var GEMINI_API_KEY, see LlmKey),
+//   - otherwise the mock, which returns canned lessons and quizzes so the whole
+//     flow can be demoed without a key.
+// Setting LlmProvider=Mock forces the mock even when a key exists (no quota used).
+var forceMock = "Mock".Equals(builder.Configuration["LlmProvider"], StringComparison.OrdinalIgnoreCase);
+var useGemini = !forceMock && LlmKey.Read(builder.Configuration) is not null;
+if (useGemini)
 {
     builder.Services.AddHttpClient<GeminiProvider>();
     builder.Services.AddSingleton<ILlmProvider, GeminiProvider>();
@@ -38,11 +42,17 @@ else
 
 // Ingestion pipeline: processes uploaded documents in the background.
 builder.Services.AddScoped<IngestionService>();
+// Adaptive teaching: topics, lessons, quizzes, checkpoints, history.
+builder.Services.AddScoped<LearningService>();
 // TEMPORARILY DISABLED: auto-ingest polls every 30s (and retries 'failed' docs), burning Gemini credits.
 // Re-enable by uncommenting the next line.
 // builder.Services.AddHostedService<IngestionBackgroundService>();
 
 var app = builder.Build();
+
+if (!useGemini)
+    app.Logger.LogWarning("*** MOCK MODE *** No Gemini API key found (or LlmProvider=Mock): "
+        + "lessons and quizzes are canned mock content, not generated from an LLM.");
 
 // Initialize DB on startup
 var schemaPath = Path.Combine(AppContext.BaseDirectory, "database", "schema.sql");
