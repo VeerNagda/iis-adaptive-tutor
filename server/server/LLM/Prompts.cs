@@ -18,6 +18,7 @@ public static class Prompts
     public const string SectionsTask = "[[TASK:SECTIONS]]";
     public const string TopicsTask = "[[TASK:TOPICS]]";
     public const string LessonTask = "[[TASK:LESSON]]";
+    public const string CheckpointTask = "[[TASK:CHECKPOINT]]";
 
     /// <summary>Questions per lesson quiz. Pass = at most one mistake (see LearningService).</summary>
     public const int QuizSize = 3;
@@ -100,21 +101,34 @@ public static class Prompts
     // source         text of the uploaded material for this step (the only allowed facts)
     // level          difficulty 1-5, turned into style instructions by StyleForLevel
     // previousLesson set on a re-teach: the explanation that did not work
-    // missed         set on a re-teach: the questions the learner got wrong
+    // missed         set on a re-teach or review: the questions the learner got wrong
+    // isReview       true for the review lesson after a weak checkpoint result;
+    //                SOURCE then covers several earlier lessons at once
     public static string Lesson(
         string topicTitle, string source, int level,
-        string? previousLesson = null, IReadOnlyList<string>? missed = null)
+        string? previousLesson = null, IReadOnlyList<string>? missed = null, bool isReview = false)
     {
-        // Only added when the same step is taught again.
         var missedList = missed is { Count: > 0 } ? string.Join(" | ", missed) : "none recorded";
-        var reteach = previousLesson is null ? "" : $"""
 
-            RE-TEACH: the learner has already seen the explanation below and it did not work.
-            Explain the same content again in a clearly different way (new wording, new example).
-            Questions they got wrong (focus on these ideas): {missedList}
-            Write NEW quiz questions; do not repeat or lightly reword the earlier ones.
-            PREVIOUS EXPLANATION: {previousLesson}
-            """;
+        // Extra instructions, only added when content is taught again.
+        var reteach = "";
+        if (isReview)
+            reteach = $"""
+
+                REVIEW: the learner scored below 60% on a checkpoint test of this material.
+                SOURCE covers several earlier lessons. Re-teach only its most important ideas,
+                concentrating on what the learner got wrong: {missedList}
+                Write NEW quiz questions; do not repeat the ones listed above.
+                """;
+        else if (previousLesson is not null)
+            reteach = $"""
+
+                RE-TEACH: the learner has already seen the explanation below and it did not work.
+                Explain the same content again in a clearly different way (new wording, new example).
+                Questions they got wrong (focus on these ideas): {missedList}
+                Write NEW quiz questions; do not repeat or lightly reword the earlier ones.
+                PREVIOUS EXPLANATION: {previousLesson}
+                """;
 
         return $$"""
             {{LessonTask}}
@@ -144,4 +158,31 @@ public static class Prompts
             SOURCE>>>
             """;
     }
+
+    // ── Checkpoint test: questions over several completed lessons ─────────────
+    // Only the questions on the CURRENT topic come from this prompt. The
+    // "few questions from earlier topics" are picked from the database by C#
+    // (questions the learner has already seen), so no LLM call is needed for them.
+    public static string Checkpoint(string topicTitle, string source, int level, int count) => $$"""
+        {{CheckpointTask}}
+        You are writing a short checkpoint test for the topic "{{topicTitle}}".
+        The learner has just finished several lessons based on SOURCE below.
+
+        Write exactly {{count}} multiple-choice questions spread across the whole of SOURCE
+        (not all on one part). Use only facts found in SOURCE.
+        Each question has 4 options with exactly one correct, plausible wrong options,
+        and a 1-2 sentence explanation of why the answer is right.
+
+        DIFFICULTY LEVEL: {{level}} of 5 (1 = easiest, 5 = hardest)
+        STYLE for this level (use its guidance on quiz questions):
+        {{StyleForLevel(level)}}
+
+        Return JSON only, in exactly this shape:
+        {"questions":[{"text":"...","options":["...","...","...","..."],"correct_index":0,"explanation":"..."}]}
+        correct_index is the 0-based position of the correct option; vary it between questions.
+
+        <<<SOURCE
+        {{source}}
+        SOURCE>>>
+        """;
 }

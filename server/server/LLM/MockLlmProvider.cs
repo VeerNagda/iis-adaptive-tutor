@@ -21,6 +21,7 @@ public sealed class MockLlmProvider : ILlmProvider
             prompt.Contains(Prompts.SectionsTask) ? MockSections(prompt) :
             prompt.Contains(Prompts.TopicsTask) ? MockTopics(prompt) :
             prompt.Contains(Prompts.LessonTask) ? MockLesson(prompt) :
+            prompt.Contains(Prompts.CheckpointTask) ? MockCheckpoint(prompt) :
             """{"error":"MockLlmProvider: unrecognised task marker."}""";
 
         return Task.FromResult(json);
@@ -72,7 +73,7 @@ public sealed class MockLlmProvider : ILlmProvider
     private static string MockLesson(string prompt)
     {
         var title = Regex.Match(prompt, "topic \"(.+?)\"").Groups[1].Value;
-        bool reteach = prompt.Contains("RE-TEACH:");
+        bool reteach = prompt.Contains("RE-TEACH:") || prompt.Contains("REVIEW:");
         // Echo the level so the adaptive difficulty is visible even in mock mode.
         int level = int.Parse(Regex.Match(prompt, @"DIFFICULTY LEVEL: (\d)").Groups[1].Value);
 
@@ -88,6 +89,14 @@ public sealed class MockLlmProvider : ILlmProvider
             insight = "(MOCK insight) A real LLM would add one extra interesting point from the material.",
             questions = MockQuestions(title, Prompts.QuizSize)
         });
+    }
+
+    // ── Checkpoint: as many canned questions as the prompt asks for ───────────
+    private static string MockCheckpoint(string prompt)
+    {
+        var title = Regex.Match(prompt, "topic \"(.+?)\"").Groups[1].Value;
+        int count = int.Parse(Regex.Match(prompt, @"exactly (\d+)").Groups[1].Value);
+        return JsonSerializer.Serialize(new { questions = MockQuestions(title, count) });
     }
 
     /// <summary>First few words of the text between the SOURCE markers of a prompt.</summary>

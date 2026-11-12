@@ -78,8 +78,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         if (existing is not null) return Convert.ToInt32(existing);
 
         var id = Convert.ToInt32(Scalar(conn,
-            "INSERT INTO sessions (course_id, current_topic_id) VALUES ($c, $t) RETURNING id",
-            ("$c", courseId), ("$t", topicId)));
+            "INSERT INTO sessions (course_id, current_topic_id, checkpoint_every) VALUES ($c, $t, $every) RETURNING id",
+            ("$c", courseId), ("$t", topicId), ("$every", NextCheckpointInterval())));
 
         // A weak topic stays 'weak' until a re-test is passed.
         if (topic.Status != "weak")
@@ -190,7 +190,13 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     //   phase 'quiz'   → learner answers the 3 questions     → SubmitAnswers()
     //        pass (0 or 1 mistakes) → next step, phase 'lesson'  (0 mistakes: level + 1)
     //        fail (2+ mistakes)     → same step, attempt + 1, level - 1, new easier lesson and new questions
-    //   phase 'done'   → all steps finished
+    //   phase 'checkpoint' → mixed test after every 3-4 lessons and at the end of the topic
+    //        current topic >= 60% → carry on (or finish)
+    //        current topic <  60% → topic marked weak, level - 1, phase 'review'
+    //   phase 'review' → one easier lesson over the lessons the checkpoint covered → Continue()
+    //   phase 'retest' → its 3 new questions; >= 60% clears "weak", otherwise a
+    //                    second review round, after which the learner moves on
+    //   phase 'done'   → all steps finished and the last checkpoint taken
 
     /// <summary>A topic is taught in at most this many lesson steps.</summary>
     private const int MaxSteps = 6;
@@ -222,15 +228,39 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             if (session.Phase == "done")
             {
                 step.Type = "done";
-                step.Message = $"You have finished all {totalSteps} lessons of \"{topic.Title}\".";
+                step.Message = $"You have finished all {totalSteps} lessons of \"{topic.Title}\"."
+                    + (topic.Status == "weak"
+                        ? " It is still marked as weak, so it is worth reviewing: it will be taught at an easier level next time."
+                        : "");
+                return step;
+            }
+
+            if (session.Phase == "checkpoint")
+            {
+                // Reuse the unanswered checkpoint test, or create it now.
+                var openQuizId = Scalar(conn, """
+                    SELECT id FROM learn_quizzes
+                    WHERE session_id = $s AND kind = 'checkpoint' AND completed_at IS NULL
+                    ORDER BY id DESC LIMIT 1
+                    """, ("$s", session.Id));
+                int checkpointId = openQuizId is not null
+                    ? Convert.ToInt32(openQuizId)
+                    : await CreateCheckpointAsync(conn, session, topic, ct);
+
+                step.Type = "quiz";
+                step.Quiz = LoadQuiz(conn, checkpointId);
                 return step;
             }
 
             // Reuse the stored lesson for this step and attempt, or create it now.
-            var lesson = FindLesson(conn, session.Id, "lesson", session.StepIndex, session.Attempt)
-                ?? await CreateLessonAsync(conn, session, topic, ct);
+            // A review lesson is stored as kind 'review', keyed by the review round.
+            bool isReview = session.Phase is "review" or "retest";
+            var lesson = (isReview
+                    ? FindLesson(conn, session.Id, "review", session.CheckpointFrom, session.ReviewRound)
+                    : FindLesson(conn, session.Id, "lesson", session.StepIndex, session.Attempt))
+                ?? await CreateLessonAsync(conn, session, topic, isReview, ct);
 
-            if (session.Phase == "lesson")
+            if (session.Phase is "lesson" or "review")
             {
                 step.Type = "lesson";
                 step.Lesson = new LessonDto { Id = lesson.Id, Text = lesson.Text, Example = lesson.Example };
@@ -254,6 +284,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         using var conn = db.CreateConnection();
         var session = LoadSession(conn, courseId, sessionId) ?? throw new LearningException("Session not found.");
         if (session.Phase == "lesson") session.Phase = "quiz";
+        else if (session.Phase == "review") session.Phase = "retest";
         SaveSession(conn, session);
     }
 
@@ -276,8 +307,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         var session = LoadSession(conn, courseId, sessionId) ?? throw new LearningException("Session not found.");
         if (session.Phase is not ("lesson" or "quiz")) throw new LearningException("Nothing to skip right now.");
 
-        AdvanceStep(session, LoadTopic(conn, session.TopicId));
         session.Reason = "You skipped the previous lesson.";
+        AdvanceStep(session, LoadTopic(conn, session.TopicId));   // may replace the reason with the checkpoint one
         SaveSession(conn, session);
     }
 
@@ -335,7 +366,9 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         }
 
         // ── Decide ──
-        DecideAfterLessonQuiz(conn, session, topic, quizId, result);
+        if (kind == "lesson") DecideAfterLessonQuiz(conn, session, topic, quizId, result);
+        else if (kind == "checkpoint") DecideAfterCheckpoint(conn, session, topic, quizId, questions, result);
+        else DecideAfterRetest(conn, session, topic, quizId, result);
 
         Exec(conn, """
             UPDATE learn_quizzes
@@ -374,9 +407,9 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
 
             if (mistakes == 0)
                 ChangeLevel(conn, topic, session.Id, +1, "Passed a lesson quiz with no mistakes");
-            AdvanceStep(session, topic);
             session.Reason = null;
-            result.Decision = session.Phase == "done" ? "done" : "advance";
+            AdvanceStep(session, topic);   // may set the reason for a checkpoint test
+            result.Decision = session.Phase == "checkpoint" ? "checkpoint" : "advance";
         }
         else
         {
@@ -411,11 +444,217 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             ("$t", topic.Id), ("$s", sessionId), ("$old", oldLevel), ("$new", newLevel), ("$reason", reason));
     }
 
-    /// <summary>Moves the session to the next lesson step, or finishes the topic.</summary>
+    /// <summary>
+    /// Moves the session to the next lesson step. A checkpoint test is due after
+    /// every 3-4 completed lessons, and once more at the end of the topic so that
+    /// every topic gets a score.
+    /// </summary>
     private static void AdvanceStep(LearnSession session, Topic topic)
     {
         session.StepIndex++;
         session.Attempt = 1;
+        session.SinceCheckpoint++;
+        session.Phase = "lesson";
+
+        bool topicFinished = session.StepIndex >= TotalSteps(topic);
+        if (topicFinished || session.SinceCheckpoint >= session.CheckpointEvery)
+        {
+            session.Phase = "checkpoint";
+            session.Reason = $"Checkpoint test: you completed {session.SinceCheckpoint} "
+                + (session.SinceCheckpoint == 1 ? "lesson" : "lessons")
+                + " since the last one. It may also include refresher questions from earlier topics.";
+        }
+    }
+
+    // ══ Checkpoint test and review ═══════════════════════════════════════════
+
+    /// <summary>A topic scoring below this percentage in a checkpoint is marked weak.</summary>
+    private const int WeakBelowPct = 60;
+    /// <summary>Questions on the current topic in a checkpoint.</summary>
+    private const int CheckpointQuestions = 4;
+    /// <summary>Extra questions taken from earlier topics.</summary>
+    private const int EarlierTopicQuestions = 2;
+    /// <summary>After this many failed review rounds the learner moves on (topic stays weak).</summary>
+    private const int MaxReviewRounds = 2;
+
+    /// <summary>"Every 3-4 lessons": picked at random between 3 and 4.</summary>
+    private static int NextCheckpointInterval() => Random.Shared.Next(3, 5);
+
+    /// <summary>
+    /// Builds the mixed checkpoint test:
+    ///   - new questions on the lessons since the last checkpoint (from the LLM);
+    ///   - up to 2 questions the learner has seen before from earlier topics,
+    ///     copied from the database, preferring weak topics and wrong answers.
+    /// </summary>
+    private async Task<int> CreateCheckpointAsync(
+        SqliteConnection conn, LearnSession session, Topic topic, CancellationToken ct)
+    {
+        var source = StepsSource(conn, topic, session.CheckpointFrom, session.StepIndex - 1);
+        var reply = await AskAsync<LlmQuiz>(
+            Prompts.Checkpoint(topic.Title, source, topic.DifficultyLevel, CheckpointQuestions), ct);
+
+        var questions = ValidQuestions(reply.Questions).Take(CheckpointQuestions).ToList();
+        if (questions.Count < 2)
+            throw new LlmException("The AI returned an incomplete checkpoint test. Please retry.");
+
+        using var tx = conn.BeginTransaction();
+        int quizId = InsertQuiz(conn, session.Id, topic.Id, null, "checkpoint", questions);
+
+        // Copy earlier-topic questions into this test, labelled so the learner knows why they appear.
+        Exec(conn, """
+            INSERT INTO learn_questions (quiz_id, topic_id, text, options, correct_index, explanation, label)
+            SELECT $quiz, q.topic_id, q.text, q.options, q.correct_index, q.explanation,
+                   'Refresher from: ' || t.title
+            FROM learn_questions q
+            JOIN topics t ON t.id = q.topic_id
+            WHERE t.course_id = $course AND q.topic_id <> $topic
+              AND q.label IS NULL AND q.user_answer IS NOT NULL
+            ORDER BY (t.status = 'weak') DESC, (q.is_correct = 0) DESC, RANDOM()
+            LIMIT $n
+            """,
+            ("$quiz", quizId), ("$course", session.CourseId), ("$topic", topic.Id), ("$n", EarlierTopicQuestions));
+        Exec(conn, "UPDATE learn_quizzes SET total = (SELECT COUNT(*) FROM learn_questions WHERE quiz_id = $q) WHERE id = $q",
+            ("$q", quizId));
+        tx.Commit();
+        return quizId;
+    }
+
+    /// <summary>
+    /// After a checkpoint: score each topic separately, record it, and mark
+    /// topics below 60% as weak (their level drops by 1).
+    ///   current topic weak → review lesson at the easier level, then a re-test;
+    ///   earlier topic weak → flagged in the topic list; it is re-taught at the
+    ///                        easier level when the learner opens it again.
+    /// </summary>
+    private void DecideAfterCheckpoint(
+        SqliteConnection conn, LearnSession session, Topic topic, int quizId,
+        List<QuestionRow> questions, AnswerResult result)
+    {
+        bool currentTopicWeak = false;
+        int currentPct = 0;
+
+        // result.Questions is in the same order as questions, so the two can be paired up.
+        var perTopic = questions.Zip(result.Questions).GroupBy(pair => pair.First.TopicId);
+        foreach (var group in perTopic)
+        {
+            var scored = group.Key == topic.Id ? topic : LoadTopic(conn, group.Key);
+            var score = RecordTopicScore(conn, session.Id, quizId, scored,
+                group.Count(pair => pair.Second.IsCorrect), group.Count());
+            result.TopicScores.Add(score);
+
+            if (score.IsWeak)
+            {
+                Exec(conn, "UPDATE topics SET status = 'weak' WHERE id = $t", ("$t", scored.Id));
+                ChangeLevel(conn, scored, session.Id, -1, $"Scored {score.ScorePct}% in a checkpoint test (below {WeakBelowPct}%)");
+            }
+            if (scored.Id == topic.Id)
+            {
+                currentTopicWeak = score.IsWeak;
+                currentPct = score.ScorePct;
+            }
+        }
+
+        result.Passed = !currentTopicWeak;
+        result.NewLevel = topic.DifficultyLevel;
+
+        if (currentTopicWeak)
+        {
+            topic.Status = "weak";
+            session.Phase = "review";
+            session.ReviewRound = 1;
+            session.Reason = ReviewReason(topic, currentPct);
+            result.Decision = "review";
+            result.Message = $"You scored {currentPct}% on this topic, which is below {WeakBelowPct}%. "
+                + "Let's review it in an easier way and then re-test.";
+        }
+        else
+        {
+            // Passing a checkpoint on a topic that was weak clears the flag.
+            ClearWeak(conn, topic);
+            FinishCheckpoint(session, topic);
+            result.Decision = session.Phase == "done" ? "done" : "advance";
+            result.Message = $"Checkpoint passed with {currentPct}% on this topic.";
+        }
+    }
+
+    /// <summary>After the re-test that follows a review lesson.</summary>
+    private void DecideAfterRetest(
+        SqliteConnection conn, LearnSession session, Topic topic, int quizId, AnswerResult result)
+    {
+        var score = RecordTopicScore(conn, session.Id, quizId, topic, result.Correct, result.Total);
+        result.TopicScores.Add(score);
+        result.Passed = !score.IsWeak;
+
+        if (result.Passed)
+        {
+            ClearWeak(conn, topic);
+            FinishCheckpoint(session, topic);
+            result.Decision = session.Phase == "done" ? "done" : "advance";
+            result.Message = $"Re-test passed with {score.ScorePct}%. This topic is no longer marked as weak.";
+        }
+        else
+        {
+            ChangeLevel(conn, topic, session.Id, -1, $"Scored {score.ScorePct}% in a re-test (below {WeakBelowPct}%)");
+
+            if (session.ReviewRound >= MaxReviewRounds)
+            {
+                // Do not trap the learner: move on, the topic stays flagged as weak.
+                FinishCheckpoint(session, topic);
+                result.Decision = session.Phase == "done" ? "done" : "advance";
+                result.Message = $"You scored {score.ScorePct}%. We will move on for now; "
+                    + "this topic stays marked as weak so you can come back to it.";
+            }
+            else
+            {
+                session.ReviewRound++;
+                session.Phase = "review";
+                session.Reason = ReviewReason(topic, score.ScorePct);
+                result.Decision = "review";
+                result.Message = $"You scored {score.ScorePct}%, still below {WeakBelowPct}%. One more review, even simpler this time.";
+            }
+        }
+        result.NewLevel = topic.DifficultyLevel;
+    }
+
+    private static string ReviewReason(Topic topic, int pct) =>
+        $"Review at an easier level ({topic.DifficultyLevel} of 5: {Prompts.StyleLabel(topic.DifficultyLevel)}) "
+        + $"because you scored {pct}% on this topic in the test (below {WeakBelowPct}%).";
+
+    /// <summary>Stores one topic's checkpoint score. Weak = below 60%.</summary>
+    private static TopicScore RecordTopicScore(
+        SqliteConnection conn, int sessionId, int quizId, Topic topic, int correct, int total)
+    {
+        int pct = correct * 100 / total;
+        bool weak = pct < WeakBelowPct;
+        Exec(conn, """
+            INSERT INTO checkpoint_results (quiz_id, session_id, topic_id, correct, total, score_pct, is_weak)
+            VALUES ($q, $s, $t, $c, $n, $pct, $weak)
+            """,
+            ("$q", quizId), ("$s", sessionId), ("$t", topic.Id),
+            ("$c", correct), ("$n", total), ("$pct", pct), ("$weak", weak ? 1 : 0));
+
+        return new TopicScore
+        {
+            TopicId = topic.Id, TopicTitle = topic.Title,
+            Correct = correct, Total = total, ScorePct = pct, IsWeak = weak,
+        };
+    }
+
+    private static void ClearWeak(SqliteConnection conn, Topic topic)
+    {
+        if (topic.Status != "weak") return;
+        topic.Status = "learning";
+        Exec(conn, "UPDATE topics SET status = 'learning' WHERE id = $t", ("$t", topic.Id));
+    }
+
+    /// <summary>Checkpoint (and any review) is over: continue with lessons or finish the topic.</summary>
+    private static void FinishCheckpoint(LearnSession session, Topic topic)
+    {
+        session.SinceCheckpoint = 0;
+        session.CheckpointFrom = session.StepIndex;
+        session.CheckpointEvery = NextCheckpointInterval();
+        session.ReviewRound = 0;
+        session.Reason = null;
         session.Phase = "lesson";
 
         if (session.StepIndex >= TotalSteps(topic))
@@ -448,25 +687,44 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             : null;
     }
 
-    /// <summary>Asks the LLM for a lesson and its quiz, then stores both.</summary>
+    /// <summary>
+    /// Asks the LLM for a lesson and its quiz, then stores both.
+    /// isReview = the review lesson after a weak checkpoint: it covers all the
+    /// lessons that checkpoint tested, and its quiz is the re-test.
+    /// </summary>
     private async Task<LessonRow> CreateLessonAsync(
-        SqliteConnection conn, LearnSession session, Topic topic, CancellationToken ct)
+        SqliteConnection conn, LearnSession session, Topic topic, bool isReview, CancellationToken ct)
     {
-        var source = StepSource(conn, topic, session.StepIndex);
+        string kind = isReview ? "review" : "lesson";
+        int stepIndex = isReview ? session.CheckpointFrom : session.StepIndex;
+        int attempt = isReview ? session.ReviewRound : session.Attempt;
+        var source = isReview
+            ? StepsSource(conn, topic, session.CheckpointFrom, session.StepIndex - 1)
+            : StepsSource(conn, topic, session.StepIndex, session.StepIndex);
 
         // On a re-teach, tell the LLM what was already tried and what was missed.
         string? previousText = null;
         List<string> missed = [];
-        if (session.Attempt > 1)
+        if (isReview)
+        {
+            // What the learner got wrong on this topic in the last checkpoint or re-test.
+            var lastTest = Scalar(conn, """
+                SELECT id FROM learn_quizzes
+                WHERE session_id = $s AND kind IN ('checkpoint', 'retest') AND completed_at IS NOT NULL
+                ORDER BY id DESC LIMIT 1
+                """, ("$s", session.Id));
+            if (lastTest is not null) missed = LoadMissedQuestions(conn, Convert.ToInt32(lastTest), topic.Id);
+        }
+        else if (session.Attempt > 1)
         {
             var previous = FindLesson(conn, session.Id, "lesson", session.StepIndex, session.Attempt - 1);
             previousText = previous?.Text;
-            if (previous is not null) missed = LoadMissedQuestions(conn, previous.QuizId);
+            if (previous is not null) missed = LoadMissedQuestions(conn, previous.QuizId, topic.Id);
         }
 
         // The topic's current level picks the teaching style (see Prompts.StyleForLevel).
         var reply = await AskAsync<LlmLesson>(
-            Prompts.Lesson(topic.Title, source, topic.DifficultyLevel, previousText, missed), ct);
+            Prompts.Lesson(topic.Title, source, topic.DifficultyLevel, previousText, missed, isReview), ct);
 
         var questions = ValidQuestions(reply.Questions).Take(Prompts.QuizSize).ToList();
         if (string.IsNullOrWhiteSpace(reply.LessonText) || questions.Count < 2)
@@ -475,12 +733,12 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         using var tx = conn.BeginTransaction();
         int lessonId = Convert.ToInt32(Scalar(conn, """
             INSERT INTO learn_lessons (session_id, topic_id, kind, step_index, attempt, level, text, example, insight, reason)
-            VALUES ($s, $t, 'lesson', $i, $a, $lvl, $text, $ex, $ins, $reason) RETURNING id
+            VALUES ($s, $t, $kind, $i, $a, $lvl, $text, $ex, $ins, $reason) RETURNING id
             """,
-            ("$s", session.Id), ("$t", topic.Id), ("$i", session.StepIndex), ("$a", session.Attempt),
+            ("$s", session.Id), ("$t", topic.Id), ("$kind", kind), ("$i", stepIndex), ("$a", attempt),
             ("$lvl", topic.DifficultyLevel), ("$text", reply.LessonText.Trim()),
             ("$ex", reply.Example), ("$ins", reply.Insight), ("$reason", session.Reason)));
-        int quizId = InsertQuiz(conn, session.Id, topic.Id, lessonId, "lesson", questions);
+        int quizId = InsertQuiz(conn, session.Id, topic.Id, lessonId, isReview ? "retest" : "lesson", questions);
         tx.Commit();
 
         return new LessonRow(lessonId, quizId, reply.LessonText.Trim(), reply.Example);
@@ -518,14 +776,16 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     private static int TotalSteps(Topic topic) => Math.Clamp(topic.ChunkIds.Count, 1, MaxSteps);
 
     /// <summary>
-    /// The uploaded text a lesson step is grounded in. The topic's chunks are
-    /// spread evenly over its steps (chunk i belongs to step i * steps / count).
+    /// The uploaded text that lesson steps fromStep..toStep are grounded in (one
+    /// step for a lesson, several for a checkpoint or review). The topic's chunks
+    /// are spread evenly over its steps (chunk i belongs to step i * steps / count).
     /// </summary>
-    private static string StepSource(SqliteConnection conn, Topic topic, int stepIndex)
+    private static string StepsSource(SqliteConnection conn, Topic topic, int fromStep, int toStep)
     {
         int steps = TotalSteps(topic);
         var texts = topic.ChunkIds
-            .Where((_, i) => i * steps / topic.ChunkIds.Count == stepIndex)
+            .Where((_, i) => i * steps / topic.ChunkIds.Count >= fromStep
+                          && i * steps / topic.ChunkIds.Count <= toStep)
             .Select(id => Scalar(conn, "SELECT text FROM chunks WHERE id = $id", ("$id", id)) as string)
             .Where(t => !string.IsNullOrWhiteSpace(t));
 
@@ -633,12 +893,13 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         return quiz;
     }
 
-    /// <summary>Texts of the questions answered wrongly in a quiz.</summary>
-    private static List<string> LoadMissedQuestions(SqliteConnection conn, int quizId)
+    /// <summary>Texts of the questions on one topic answered wrongly in a quiz.</summary>
+    private static List<string> LoadMissedQuestions(SqliteConnection conn, int quizId, int topicId)
     {
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT text FROM learn_questions WHERE quiz_id = $q AND is_correct = 0";
+        cmd.CommandText = "SELECT text FROM learn_questions WHERE quiz_id = $q AND topic_id = $t AND is_correct = 0";
         cmd.Parameters.AddWithValue("$q", quizId);
+        cmd.Parameters.AddWithValue("$t", topicId);
         var texts = new List<string>();
         using var r = cmd.ExecuteReader();
         while (r.Read()) texts.Add(r.GetString(0));
