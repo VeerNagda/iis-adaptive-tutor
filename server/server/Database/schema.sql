@@ -1,305 +1,206 @@
-PRAGMA foreign_keys = ON; -- SQLite: must also be set on every new connection in code
+-- Complete database schema for the adaptive tutor.
+--
+-- DatabaseInitializer runs this file on every start. Every statement uses
+-- IF NOT EXISTS, so on a fresh install it creates everything and on an existing
+-- database it changes nothing.
+--
+-- Editing note: the file is split into statements on the semicolon character,
+-- so never write a semicolon inside a comment.
+
+-- ── Course material ──────────────────────────────────────────────────────────
 
 -- 1. Courses
-CREATE TABLE courses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS courses (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT NOT NULL,
     description TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at  TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
 -- 2. Uploaded documents
-CREATE TABLE documents (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    course_id INTEGER NOT NULL,
-    filename TEXT NOT NULL,
-    file_type TEXT NOT NULL
-        CHECK (file_type IN ('pdf', 'pptx', 'docx')),
-    file_path TEXT NOT NULL,
-    extracted_text TEXT,
+CREATE TABLE IF NOT EXISTS documents (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    course_id         INTEGER NOT NULL,
+    filename          TEXT NOT NULL,
+    file_type         TEXT NOT NULL CHECK (file_type IN ('pdf', 'pptx', 'docx')),
+    file_path         TEXT NOT NULL,
+    extracted_text    TEXT,
     processing_status TEXT DEFAULT 'pending'
-        CHECK (processing_status IN (
-            'pending', 'processing', 'completed', 'failed'
-        )),
-    error_message TEXT,          -- set by the Python ingestion pipeline on failure
-    uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    deleted_at TEXT,
-    FOREIGN KEY (course_id) REFERENCES courses(id)
-        ON DELETE CASCADE
+        CHECK (processing_status IN ('pending', 'processing', 'completed', 'failed')),
+    error_message     TEXT,
+    uploaded_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+    deleted_at        TEXT,
+    FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
 );
 
--- 3. Topics generated from documents
-CREATE TABLE topics (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    course_id INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT,
-    sequence_number INTEGER NOT NULL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (course_id) REFERENCES courses(id)
-        ON DELETE CASCADE,
-    UNIQUE(course_id, sequence_number)
-);
-
--- 4. Concepts within topics
--- Prerequisites now live in concept_prerequisites (below), not a JSON column.
-CREATE TABLE concepts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    topic_id INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    learning_objective TEXT,
-    sequence_number INTEGER NOT NULL,
-    difficulty_level INTEGER DEFAULT 1
-        CHECK (difficulty_level BETWEEN 1 AND 3),
-    FOREIGN KEY (topic_id) REFERENCES topics(id)
-        ON DELETE CASCADE,
-    UNIQUE(topic_id, sequence_number)
-);
-
--- 4b. Concept prerequisites (replaces JSON array)
-CREATE TABLE concept_prerequisites (
-    concept_id INTEGER NOT NULL,
-    prerequisite_id INTEGER NOT NULL,
-    PRIMARY KEY (concept_id, prerequisite_id),
-    CHECK (concept_id <> prerequisite_id),
-    FOREIGN KEY (concept_id) REFERENCES concepts(id)
-        ON DELETE CASCADE,
-    FOREIGN KEY (prerequisite_id) REFERENCES concepts(id)
-        ON DELETE CASCADE
-);
-
--- 5. Links concepts to their source material
-CREATE TABLE concept_sources (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    concept_id INTEGER NOT NULL,
+-- 3. Text passages extracted from a document (ingestion pipeline)
+CREATE TABLE IF NOT EXISTS chunks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
     document_id INTEGER NOT NULL,
-    page_number INTEGER,
-    slide_number INTEGER,
-    relevant_text TEXT,
-    FOREIGN KEY (concept_id) REFERENCES concepts(id)
-        ON DELETE CASCADE,
-    FOREIGN KEY (document_id) REFERENCES documents(id)
-        ON DELETE CASCADE
-);
-
--- 6. Learning sessions
-CREATE TABLE sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    course_id INTEGER NOT NULL,
-    current_topic_id INTEGER,
-    current_concept_id INTEGER,
-    current_level INTEGER DEFAULT 1
-        CHECK (current_level BETWEEN 1 AND 3),
-    status TEXT DEFAULT 'active'
-        CHECK (status IN ('active', 'completed', 'paused')),
-    started_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    ended_at TEXT,
-    FOREIGN KEY (course_id) REFERENCES courses(id),
-    FOREIGN KEY (current_topic_id) REFERENCES topics(id),
-    FOREIGN KEY (current_concept_id) REFERENCES concepts(id)
-);
-
--- 7. Generated teaching content (NEW)
--- One row per explanation shown. Re-teaching creates a new row at an easier level,
--- so level 1 vs level 2 explanations can be compared side by side.
-CREATE TABLE lessons (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    concept_id INTEGER NOT NULL,
-    session_id INTEGER NOT NULL,
-    level INTEGER NOT NULL
-        CHECK (level BETWEEN 1 AND 3),
-    content TEXT NOT NULL,
-    format TEXT DEFAULT 'text'
-        CHECK (format IN ('text', 'analogy', 'example', 'steps', 'interactive')),
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (concept_id) REFERENCES concepts(id)
-        ON DELETE CASCADE,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
-        ON DELETE CASCADE
-);
-
--- 8. Assessments: quizzes, cumulative tests and spaced-review quizzes
-CREATE TABLE assessments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id INTEGER NOT NULL,
-    assessment_type TEXT NOT NULL
-        CHECK (assessment_type IN ('concept_quiz', 'cumulative', 'review')),
-    title TEXT,
-    total_questions INTEGER DEFAULT 0,
-    score REAL,
-    completed_at TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
-        ON DELETE CASCADE
-);
-
--- 9. Questions belonging to assessments
-CREATE TABLE assessment_questions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    assessment_id INTEGER NOT NULL,
-    concept_id INTEGER NOT NULL,
-    question TEXT NOT NULL,
-    question_type TEXT DEFAULT 'short_answer'
-        CHECK (question_type IN ('mcq', 'short_answer', 'true_false')),
-    options TEXT, -- JSON array for MCQs
-    correct_answer TEXT,
-    explanation TEXT,
-    difficulty_level INTEGER DEFAULT 1
-        CHECK (difficulty_level BETWEEN 1 AND 3),
-    is_review INTEGER DEFAULT 0
-        CHECK (is_review IN (0, 1)), -- 1 = injected from an earlier section
-    FOREIGN KEY (assessment_id) REFERENCES assessments(id)
-        ON DELETE CASCADE,
-    FOREIGN KEY (concept_id) REFERENCES concepts(id)
-);
-
--- 10. Student responses to assessment questions
--- score is the real signal (0 to 1, LLM-graded for short answers).
--- is_correct is derived: score >= 0.7 (document this threshold in the report).
-CREATE TABLE assessment_responses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    question_id INTEGER NOT NULL,
-    student_answer TEXT,
-    score REAL
-        CHECK (score IS NULL OR score BETWEEN 0 AND 1),
-    feedback TEXT,
-    is_correct INTEGER
-        CHECK (is_correct IS NULL OR is_correct IN (0, 1)),
-    answered_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (question_id) REFERENCES assessment_questions(id)
-        ON DELETE CASCADE
-);
-
--- 11. Conversation history
-CREATE TABLE messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id INTEGER NOT NULL,
-    concept_id INTEGER,
-    lesson_id INTEGER,
-    assessment_id INTEGER,
-    role TEXT NOT NULL
-        CHECK (role IN ('student', 'tutor', 'system')),
-    content TEXT NOT NULL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
-        ON DELETE CASCADE,
-    FOREIGN KEY (concept_id) REFERENCES concepts(id),
-    FOREIGN KEY (lesson_id) REFERENCES lessons(id)
-        ON DELETE SET NULL,
-    FOREIGN KEY (assessment_id) REFERENCES assessments(id)
-        ON DELETE SET NULL
-);
-
--- 12. Student progress for each concept
--- Single-user by design: concept_id is UNIQUE with no user link.
--- For multi-user support, add user_id and make UNIQUE(user_id, concept_id).
--- Spaced review: next_review_at is set from review_count using a simple
--- doubling interval (e.g. 1, 2, 4, 8 days). Implemented in app code.
-CREATE TABLE concept_progress (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    concept_id INTEGER NOT NULL UNIQUE,
-    mastery_score REAL DEFAULT 0
-        CHECK (mastery_score BETWEEN 0 AND 100),
-    current_level INTEGER DEFAULT 1
-        CHECK (current_level BETWEEN 1 AND 3),
-    attempts INTEGER DEFAULT 0,
-    last_assessed_at TEXT,
-    next_review_at TEXT,
-    review_count INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'not_started'
-        CHECK (status IN (
-            'not_started', 'learning', 'needs_revision', 'mastered'
-        )),
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (concept_id) REFERENCES concepts(id)
-        ON DELETE CASCADE
-);
-
--- 13. Records adaptive teaching decisions
-CREATE TABLE adaptive_decisions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id INTEGER NOT NULL,
-    concept_id INTEGER NOT NULL,
-    understanding_score REAL,
-    previous_level INTEGER,
-    new_level INTEGER,
-    action TEXT NOT NULL
-        CHECK (action IN ('advance', 'reteach', 'review', 'hold')),
-    reason TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
-        ON DELETE CASCADE,
-    FOREIGN KEY (concept_id) REFERENCES concepts(id)
-);
-
--- 14. Verbatim text passages extracted from uploaded documents (C# ingestion pipeline)
-CREATE TABLE chunks (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    document_id  INTEGER NOT NULL,
-    chunk_index  INTEGER NOT NULL,
-    text         TEXT    NOT NULL,
-    page_start   INTEGER,
-    page_end     INTEGER,
-    heading      TEXT,
-    embedding    TEXT,   -- JSON float array (768-dim, text-embedding-004)
+    chunk_index INTEGER NOT NULL,
+    text        TEXT    NOT NULL,
+    page_start  INTEGER,
+    page_end    INTEGER,
+    heading     TEXT,
+    embedding   TEXT,   -- JSON float array
     UNIQUE (document_id, chunk_index),
     FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
 );
 
--- 15. Learning sections derived from chunks (Python ingestion pipeline)
-CREATE TABLE document_sections (
+-- 4. Learning sections of a document, each grouping some chunks (ingestion pipeline)
+CREATE TABLE IF NOT EXISTS document_sections (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     document_id   INTEGER NOT NULL,
     section_index INTEGER NOT NULL,
     title         TEXT    NOT NULL,
     summary       TEXT,
-    key_concepts  TEXT,   -- JSON array of concept name strings
-    difficulty    INTEGER DEFAULT 1
-                  CHECK (difficulty BETWEEN 1 AND 3),
+    key_concepts  TEXT,   -- JSON array of concept names
+    difficulty    INTEGER DEFAULT 1 CHECK (difficulty BETWEEN 1 AND 3),
     chunk_indexes TEXT,   -- JSON array of 0-based chunk indexes
     UNIQUE (document_id, section_index),
     FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
 );
 
--- Indexes
-CREATE INDEX idx_documents_course
-    ON documents(course_id);
+-- ── Adaptive teaching ("Start Learning") ─────────────────────────────────────
 
-CREATE INDEX idx_topics_course
-    ON topics(course_id, sequence_number);
+-- 5. Topics extracted from the sections by the LLM, plus the learner's state
+--    chunk_ids         JSON array of chunks.id the topic is taught from
+--    difficulty_level  1 (easiest) to 5 (hardest), starts at 3, remembered across sessions
+--    status            new, learning, completed or weak
+CREATE TABLE IF NOT EXISTS topics (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    course_id        INTEGER NOT NULL,
+    title            TEXT NOT NULL,
+    description      TEXT,
+    sequence_number  INTEGER NOT NULL,
+    chunk_ids        TEXT,
+    difficulty_level INTEGER NOT NULL DEFAULT 3 CHECK (difficulty_level BETWEEN 1 AND 5),
+    status           TEXT NOT NULL DEFAULT 'new'
+        CHECK (status IN ('new', 'learning', 'completed', 'weak')),
+    created_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE,
+    UNIQUE (course_id, sequence_number)
+);
 
-CREATE INDEX idx_concepts_topic
-    ON concepts(topic_id, sequence_number);
+-- 6. Learning sessions. One session teaches one topic, and the row stores the
+--    position in the lesson loop so a refresh resumes at the same place.
+--    phase             lesson, quiz, checkpoint, review, retest or done
+--    step_index        0-based lesson step within the topic
+--    attempt           1 for the first explanation of a step, 2 or more for a re-teach
+--    since_checkpoint  lessons completed since the last checkpoint test
+--    checkpoint_every  3 or 4, picked at random after each checkpoint
+--    checkpoint_from   first step covered by the next checkpoint
+--    review_round      0 when not in review, 1 or 2 during a weak-topic review
+--    reason            why the current content is shown (transparency label)
+CREATE TABLE IF NOT EXISTS sessions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    course_id        INTEGER NOT NULL,
+    current_topic_id INTEGER,
+    status           TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed')),
+    phase            TEXT NOT NULL DEFAULT 'lesson',
+    step_index       INTEGER NOT NULL DEFAULT 0,
+    attempt          INTEGER NOT NULL DEFAULT 1,
+    since_checkpoint INTEGER NOT NULL DEFAULT 0,
+    checkpoint_every INTEGER NOT NULL DEFAULT 3,
+    checkpoint_from  INTEGER NOT NULL DEFAULT 0,
+    review_round     INTEGER NOT NULL DEFAULT 0,
+    reason           TEXT,
+    started_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+    ended_at         TEXT,
+    FOREIGN KEY (course_id)        REFERENCES courses(id) ON DELETE CASCADE,
+    FOREIGN KEY (current_topic_id) REFERENCES topics(id)  ON DELETE CASCADE
+);
 
-CREATE INDEX idx_concept_sources_concept
-    ON concept_sources(concept_id);
+-- 7. Every lesson text shown to the learner
+--    kind is 'lesson' (normal step) or 'review' (weak-topic re-teach after a checkpoint)
+CREATE TABLE IF NOT EXISTS learn_lessons (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    topic_id   INTEGER NOT NULL,
+    kind       TEXT    NOT NULL DEFAULT 'lesson',
+    step_index INTEGER NOT NULL,
+    attempt    INTEGER NOT NULL,
+    level      INTEGER NOT NULL,
+    text       TEXT    NOT NULL,
+    example    TEXT,
+    insight    TEXT,
+    reason     TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+    FOREIGN KEY (topic_id)   REFERENCES topics(id)   ON DELETE CASCADE
+);
 
-CREATE INDEX idx_lessons_concept
-    ON lessons(concept_id, level);
+-- 8. One row per quiz
+--    kind is 'lesson' (after a lesson), 'checkpoint' (mixed test) or 'retest' (after a review)
+--    correct and passed stay NULL until the learner submits answers
+CREATE TABLE IF NOT EXISTS learn_quizzes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   INTEGER NOT NULL,
+    topic_id     INTEGER NOT NULL,
+    lesson_id    INTEGER,
+    kind         TEXT    NOT NULL,
+    total        INTEGER NOT NULL,
+    correct      INTEGER,
+    passed       INTEGER,
+    simulated    INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)      ON DELETE CASCADE,
+    FOREIGN KEY (topic_id)   REFERENCES topics(id)        ON DELETE CASCADE,
+    FOREIGN KEY (lesson_id)  REFERENCES learn_lessons(id) ON DELETE CASCADE
+);
 
-CREATE INDEX idx_messages_session
-    ON messages(session_id, created_at);
+-- 9. Quiz questions plus the learner's answer
+--    topic_id is per question because a test can mix several topics
+CREATE TABLE IF NOT EXISTS learn_questions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    quiz_id       INTEGER NOT NULL,
+    topic_id      INTEGER NOT NULL,
+    text          TEXT    NOT NULL,
+    options       TEXT    NOT NULL,   -- JSON array of option texts
+    correct_index INTEGER NOT NULL,   -- 0-based position of the correct option
+    explanation   TEXT,
+    label         TEXT,               -- for example "Refresher from: Topic X"
+    user_answer   INTEGER,
+    is_correct    INTEGER,
+    FOREIGN KEY (quiz_id)  REFERENCES learn_quizzes(id) ON DELETE CASCADE,
+    FOREIGN KEY (topic_id) REFERENCES topics(id)        ON DELETE CASCADE
+);
 
-CREATE INDEX idx_assessments_session
-    ON assessments(session_id);
+-- 10. Every change of a topic's difficulty level, with the reason
+CREATE TABLE IF NOT EXISTS difficulty_history (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic_id   INTEGER NOT NULL,
+    session_id INTEGER,
+    old_level  INTEGER NOT NULL,
+    new_level  INTEGER NOT NULL,
+    reason     TEXT    NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (topic_id)   REFERENCES topics(id)   ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE SET NULL
+);
 
-CREATE INDEX idx_questions_assessment
-    ON assessment_questions(assessment_id);
+-- 11. Score per topic for each checkpoint or re-test (weak means below 60%)
+CREATE TABLE IF NOT EXISTS checkpoint_results (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    quiz_id    INTEGER NOT NULL,
+    session_id INTEGER NOT NULL,
+    topic_id   INTEGER NOT NULL,
+    correct    INTEGER NOT NULL,
+    total      INTEGER NOT NULL,
+    score_pct  INTEGER NOT NULL,
+    is_weak    INTEGER NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (quiz_id)    REFERENCES learn_quizzes(id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)      ON DELETE CASCADE,
+    FOREIGN KEY (topic_id)   REFERENCES topics(id)        ON DELETE CASCADE
+);
 
-CREATE INDEX idx_questions_concept
-    ON assessment_questions(concept_id);
-
-CREATE INDEX idx_responses_question
-    ON assessment_responses(question_id);
-
-CREATE INDEX idx_progress_review
-    ON concept_progress(status, next_review_at);
-
-CREATE INDEX idx_decisions_concept
-    ON adaptive_decisions(concept_id, created_at);
-
-CREATE INDEX idx_chunks_document
-    ON chunks(document_id, chunk_index);
-
-CREATE INDEX idx_sections_document
-    ON document_sections(document_id, section_index);
+-- ── Indexes ──────────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_documents_course       ON documents(course_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_document        ON chunks(document_id, chunk_index);
+CREATE INDEX IF NOT EXISTS idx_sections_document      ON document_sections(document_id, section_index);
+CREATE INDEX IF NOT EXISTS idx_topics_course          ON topics(course_id, sequence_number);
+CREATE INDEX IF NOT EXISTS idx_learn_lessons_session  ON learn_lessons(session_id, kind, step_index, attempt);
+CREATE INDEX IF NOT EXISTS idx_learn_quizzes_session  ON learn_quizzes(session_id);
+CREATE INDEX IF NOT EXISTS idx_learn_questions_quiz   ON learn_questions(quiz_id)
