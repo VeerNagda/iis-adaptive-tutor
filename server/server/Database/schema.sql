@@ -159,7 +159,8 @@ CREATE TABLE IF NOT EXISTS learn_questions (
     text          TEXT    NOT NULL,
     options       TEXT    NOT NULL,   -- JSON array of option texts
     correct_index INTEGER NOT NULL,   -- 0-based position of the correct option
-    explanation   TEXT,
+    explanation   TEXT,               -- why the correct option is right
+    option_feedback TEXT,             -- JSON array, one sentence per option: why it is right or wrong
     label         TEXT,               -- for example "Refresher from: Topic X"
     user_answer   INTEGER,
     is_correct    INTEGER,

@@ -123,7 +123,12 @@ public sealed class MockLlmProvider : ILlmProvider
                     .Select(o => o == correct ? "The correct answer" : $"A wrong answer ({(char)('A' + o)})")
                     .ToArray(),
                 correct_index = correct,
-                explanation = "(MOCK explanation) A real LLM would explain here why this option is right."
+                explanation = "(MOCK explanation) A real LLM would explain here why this option is right.",
+                option_feedback = Enumerable.Range(0, 4)
+                    .Select(o => o == correct
+                        ? "(MOCK) This option is right."
+                        : $"(MOCK) Option {(char)('A' + o)} is wrong: a real LLM would name the misunderstanding behind it here.")
+                    .ToArray()
             };
         }).ToArray();
     }

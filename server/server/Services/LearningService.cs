@@ -363,6 +363,10 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 CorrectIndex = q.CorrectIndex,
                 IsCorrect = isCorrect,
                 Explanation = q.Explanation,
+                // What went wrong: the stored reason why the option the learner picked is wrong.
+                WhatWentWrong = !isCorrect && answers[i] >= 0 && answers[i] < q.OptionFeedback.Count
+                    ? q.OptionFeedback[answers[i]]
+                    : null,
             });
         }
 
@@ -400,7 +404,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         {
             result.Message = mistakes == 0
                 ? "Excellent, every answer was correct!"
-                : "Good work, you passed with just one slip.";
+                : "Good work, you passed with just one slip. Here is what went wrong on that question:";
             result.Insight = Scalar(conn, """
                 SELECT l.insight FROM learn_lessons l
                 JOIN learn_quizzes q ON q.lesson_id = l.id WHERE q.id = $q
@@ -503,8 +507,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
 
         // Copy earlier-topic questions into this test, labelled so the learner knows why they appear.
         Exec(conn, """
-            INSERT INTO learn_questions (quiz_id, topic_id, text, options, correct_index, explanation, label)
-            SELECT $quiz, q.topic_id, q.text, q.options, q.correct_index, q.explanation,
+            INSERT INTO learn_questions (quiz_id, topic_id, text, options, correct_index, explanation, option_feedback, label)
+            SELECT $quiz, q.topic_id, q.text, q.options, q.correct_index, q.explanation, q.option_feedback,
                    'Refresher from: ' || t.title
             FROM learn_questions q
             JOIN topics t ON t.id = q.topic_id
@@ -763,11 +767,12 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
 
         foreach (var q in questions)
             Exec(conn, """
-                INSERT INTO learn_questions (quiz_id, topic_id, text, options, correct_index, explanation)
-                VALUES ($q, $t, $text, $opts, $ci, $ex)
+                INSERT INTO learn_questions (quiz_id, topic_id, text, options, correct_index, explanation, option_feedback)
+                VALUES ($q, $t, $text, $opts, $ci, $ex, $fb)
                 """,
                 ("$q", quizId), ("$t", topicId), ("$text", q.Text.Trim()),
-                ("$opts", JsonSerializer.Serialize(q.Options)), ("$ci", q.CorrectIndex), ("$ex", q.Explanation));
+                ("$opts", JsonSerializer.Serialize(q.Options)), ("$ci", q.CorrectIndex), ("$ex", q.Explanation),
+                ("$fb", JsonSerializer.Serialize(q.OptionFeedback)));
 
         return quizId;
     }
@@ -854,19 +859,21 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         return LoadTopics(conn, courseId).First(t => t.Id == topicId);
     }
 
-    private sealed record QuestionRow(int Id, int TopicId, int CorrectIndex, int OptionCount, string? Explanation);
+    private sealed record QuestionRow(
+        int Id, int TopicId, int CorrectIndex, int OptionCount, string? Explanation, List<string> OptionFeedback);
 
     private static List<QuestionRow> LoadQuestionRows(SqliteConnection conn, int quizId)
     {
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT id, topic_id, correct_index, options, explanation FROM learn_questions WHERE quiz_id = $q ORDER BY id";
+        cmd.CommandText = "SELECT id, topic_id, correct_index, options, explanation, option_feedback FROM learn_questions WHERE quiz_id = $q ORDER BY id";
         cmd.Parameters.AddWithValue("$q", quizId);
         var rows = new List<QuestionRow>();
         using var r = cmd.ExecuteReader();
         while (r.Read())
             rows.Add(new QuestionRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2),
                 JsonSerializer.Deserialize<List<string>>(r.GetString(3))!.Count,
-                r.IsDBNull(4) ? null : r.GetString(4)));
+                r.IsDBNull(4) ? null : r.GetString(4),
+                r.IsDBNull(5) ? [] : JsonSerializer.Deserialize<List<string>>(r.GetString(5)) ?? []));
         return rows;
     }
 

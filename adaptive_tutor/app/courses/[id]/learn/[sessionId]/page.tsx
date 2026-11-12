@@ -37,7 +37,14 @@ type AnswerResult = {
   insight: string | null;
   oldLevel: number;
   newLevel: number;
-  questions: { questionId: number; userAnswer: number; correctIndex: number; isCorrect: boolean; explanation: string | null }[];
+  questions: {
+    questionId: number;
+    userAnswer: number;
+    correctIndex: number;
+    isCorrect: boolean;
+    explanation: string | null; // why the correct option is right
+    whatWentWrong: string | null; // why the option the learner picked is wrong
+  }[];
   topicScores: { topicId: number; topicTitle: string; correct: number; total: number; scorePct: number; isWeak: boolean }[];
 };
 
@@ -223,6 +230,10 @@ function QuizView({
 
 function FeedbackView({ step, result, busy, onNext }: { step: Step; result: AnswerResult; busy: boolean; onNext: () => void }) {
   const quiz = step.quiz!;
+  // Passed with exactly one mistake: that mistake is explained right in the summary box.
+  const wrong = result.questions.filter((f) => !f.isCorrect);
+  const singleMistake = result.passed && wrong.length === 1 ? wrong[0] : null;
+  const singleMistakeQuestion = singleMistake ? quiz.questions.find((q) => q.id === singleMistake.questionId) : null;
   return (
     <div>
       <div className={`mb-4 rounded-xl border px-4 py-3 ${result.passed ? "border-green-200 bg-green-50" : "border-amber-200 bg-amber-50"}`}>
@@ -235,6 +246,17 @@ function FeedbackView({ step, result, busy, onNext }: { step: Step; result: Answ
           )}
         </p>
         <p className="mt-1 text-sm text-zinc-700">{result.message}</p>
+        {singleMistake && singleMistakeQuestion && (
+          <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-zinc-800">
+            <p className="font-medium">{singleMistakeQuestion.text}</p>
+            <p className="mt-1">You chose: {singleMistakeQuestion.options[singleMistake.userAnswer] ?? "none"}</p>
+            <p className="mt-1">
+              <span className="font-semibold">What went wrong: </span>
+              {singleMistake.whatWentWrong ?? singleMistake.explanation}
+            </p>
+            <p className="mt-1">Correct answer: {singleMistakeQuestion.options[singleMistake.correctIndex]}</p>
+          </div>
+        )}
         {result.insight && (
           <p className="mt-2 text-sm text-zinc-700">
             <span className="font-semibold">Insight: </span>{result.insight}
@@ -279,6 +301,9 @@ function FeedbackView({ step, result, busy, onNext }: { step: Step; result: Answ
                 </span>
               </p>
               <p className="text-zinc-700">Your answer: {q.options[fb.userAnswer] ?? "none"}</p>
+              {!fb.isCorrect && fb.whatWentWrong && (
+                <p className="text-zinc-700"><span className="font-medium">What went wrong: </span>{fb.whatWentWrong}</p>
+              )}
               {!fb.isCorrect && <p className="text-zinc-700">Correct answer: {q.options[fb.correctIndex]}</p>}
               {fb.explanation && <p className="mt-2 text-zinc-500">{fb.explanation}</p>}
             </li>

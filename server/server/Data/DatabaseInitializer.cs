@@ -92,6 +92,7 @@ public static class DatabaseInitializer
         AddColumn(connection, "topics", "chunk_ids", "TEXT");
         AddColumn(connection, "topics", "difficulty_level", "INTEGER NOT NULL DEFAULT 3");
         AddColumn(connection, "topics", "status", "TEXT NOT NULL DEFAULT 'new'");
+        AddColumn(connection, "learn_questions", "option_feedback", "TEXT");
     }
 
     /// <summary>Adds a column if the table does not have it yet. Returns true if it was added.</summary>

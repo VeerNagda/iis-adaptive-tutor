@@ -23,6 +23,20 @@ public static class Prompts
     /// <summary>Questions per lesson quiz. Pass = at most one mistake (see LearningService).</summary>
     public const int QuizSize = 3;
 
+    // ── Shape of one quiz question (shared by the lesson and checkpoint prompts) ─
+    // option_feedback is what lets the app tell a learner WHY their wrong answer
+    // was wrong: the reason for every option is written together with the
+    // question, stored, and shown later without a second LLM call.
+    private const string QuestionShape =
+        """{"text":"...","options":["...","...","...","..."],"correct_index":0,"explanation":"...","option_feedback":["...","...","...","..."]}""";
+
+    private const string QuestionRules =
+        "Each question has 4 options with exactly one correct and plausible wrong options. "
+        + "explanation: 1-2 sentences on why the correct option is right. "
+        + "option_feedback: one short sentence per option, in the same order as options. For a wrong "
+        + "option, name the misunderstanding behind it and say why it is wrong; for the correct option, say why it is right. "
+        + "correct_index is the 0-based position of the correct option; vary it between questions.";
+
     // ── Adaptive difficulty: level → teaching style ───────────────────────────
     // Each topic has a difficulty level from 1 (easiest) to 5 (hardest). The
     // level itself is changed by plain C# rules in LearningService; here it is
@@ -143,15 +157,13 @@ public static class Prompts
             {{reteach}}
 
             After the lesson, write {{QuizSize}} multiple-choice questions that can be answered
-            from your lesson_text alone. Each question has 4 options with exactly one correct,
-            plausible wrong options, and a 1-2 sentence explanation of why the answer is right.
+            from your lesson_text alone. {{QuestionRules}}
 
             Return JSON only, in exactly this shape:
             {"lesson_text":"the lesson",
              "example":"one concrete example or analogy",
              "insight":"one sentence: an extra interesting point from SOURCE that goes slightly beyond the lesson",
-             "questions":[{"text":"...","options":["...","...","...","..."],"correct_index":0,"explanation":"..."}]}
-            correct_index is the 0-based position of the correct option; vary it between questions.
+             "questions":[{{QuestionShape}}]}
 
             <<<SOURCE
             {{source}}
@@ -170,16 +182,14 @@ public static class Prompts
 
         Write exactly {{count}} multiple-choice questions spread across the whole of SOURCE
         (not all on one part). Use only facts found in SOURCE.
-        Each question has 4 options with exactly one correct, plausible wrong options,
-        and a 1-2 sentence explanation of why the answer is right.
+        {{QuestionRules}}
 
         DIFFICULTY LEVEL: {{level}} of 5 (1 = easiest, 5 = hardest)
         STYLE for this level (use its guidance on quiz questions):
         {{StyleForLevel(level)}}
 
         Return JSON only, in exactly this shape:
-        {"questions":[{"text":"...","options":["...","...","...","..."],"correct_index":0,"explanation":"..."}]}
-        correct_index is the 0-based position of the correct option; vary it between questions.
+        {"questions":[{{QuestionShape}}]}
 
         <<<SOURCE
         {{source}}

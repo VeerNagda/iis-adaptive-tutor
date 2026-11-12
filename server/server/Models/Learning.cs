@@ -42,6 +42,11 @@ public class LlmQuestion
     /// <summary>0-based position of the correct option in <see cref="Options"/>.</summary>
     [JsonPropertyName("correct_index")] public int CorrectIndex { get; set; }
     [JsonPropertyName("explanation")] public string Explanation { get; set; } = "";
+    /// <summary>
+    /// One sentence per option, in the same order as <see cref="Options"/>: why that
+    /// option is right or wrong. Lets the app explain a mistake without another LLM call.
+    /// </summary>
+    [JsonPropertyName("option_feedback")] public List<string> OptionFeedback { get; set; } = [];
 }
 
 // ══ 2. Database rows used by LearningService ═════════════════════════════════
@@ -155,7 +160,10 @@ public class QuestionFeedback
     public int UserAnswer { get; set; }
     public int CorrectIndex { get; set; }
     public bool IsCorrect { get; set; }
+    /// <summary>Why the correct option is right.</summary>
     public string? Explanation { get; set; }
+    /// <summary>Only for a wrong answer: why the option the learner picked is wrong.</summary>
+    public string? WhatWentWrong { get; set; }
 }
 
 public class TopicScore
