@@ -93,6 +93,9 @@ public static class DatabaseInitializer
         AddColumn(connection, "topics", "difficulty_level", "INTEGER NOT NULL DEFAULT 3");
         AddColumn(connection, "topics", "status", "TEXT NOT NULL DEFAULT 'new'");
         AddColumn(connection, "learn_questions", "option_feedback", "TEXT");
+        AddColumn(connection, "courses", "topic_test_every", "INTEGER NOT NULL DEFAULT 0");
+        AddColumn(connection, "topics", "awaiting_test", "INTEGER NOT NULL DEFAULT 0");
+        AddColumn(connection, "sessions", "kind", "TEXT NOT NULL DEFAULT 'topic'");
 
         // Documents whose topics already exist must not be extracted a second time.
         if (AddColumn(connection, "documents", "topics_extracted", "INTEGER NOT NULL DEFAULT 0"))

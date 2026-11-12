@@ -20,11 +20,18 @@ public class LearningController(LearningService learning) : ControllerBase
 
     /// <summary>Start (or resume) a learning session on one topic.</summary>
     [HttpPost("topics/{topicId:int}/sessions")]
-    public IActionResult StartSession(int courseId, int topicId)
-    {
-        var sessionId = learning.StartSession(courseId, topicId);
-        return sessionId is null ? NotFound("Topic not found.") : Ok(new { id = sessionId });
-    }
+    public Task<IActionResult> StartSession(int courseId, int topicId) =>
+        Run(() =>
+        {
+            var sessionId = learning.StartSession(courseId, topicId);
+            return Task.FromResult<IActionResult>(
+                sessionId is null ? NotFound("Topic not found.") : Ok(new { id = sessionId }));
+        });
+
+    /// <summary>Start (or resume) the mandatory test over the recently completed topics.</summary>
+    [HttpPost("topic-test")]
+    public Task<IActionResult> StartTopicTest(int courseId) =>
+        Run(() => Task.FromResult<IActionResult>(Ok(new { id = learning.StartTopicTest(courseId) })));
 
     // ── Lesson loop: /courses/{id}/sessions/{sessionId}/... ───────────────────
 

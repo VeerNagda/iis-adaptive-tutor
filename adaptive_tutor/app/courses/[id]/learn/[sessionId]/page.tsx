@@ -9,7 +9,7 @@ import { apiService } from "../../../../services/apiService";
 // ─── Types (match the backend's Models/Learning.cs) ──────────────────────────
 
 type Question = { id: number; text: string; options: string[]; label: string | null };
-type Quiz = { id: number; kind: "lesson" | "checkpoint" | "retest"; questions: Question[] };
+type Quiz = { id: number; kind: "lesson" | "checkpoint" | "retest" | "topic_test"; questions: Question[] };
 
 type Step = {
   type: "lesson" | "quiz" | "done";
@@ -59,6 +59,7 @@ const QUIZ_TITLE: Record<Quiz["kind"], string> = {
   lesson: "Quick quiz",
   checkpoint: "Checkpoint test",
   retest: "Re-test",
+  topic_test: "Mandatory topic test",
 };
 
 const NEXT_LABEL: Record<AnswerResult["decision"], string> = {
@@ -400,14 +401,15 @@ function SessionContent() {
             <Link href={`/courses/${courseId}/learn`} className="text-sm text-zinc-500 hover:text-zinc-800">← Topics</Link>
             <span className="text-zinc-300">/</span>
             <h1 className="flex-1 truncate text-sm font-semibold text-zinc-900">{header?.topicTitle ?? "…"}</h1>
-            {header && (
+            {header && header.level > 0 && (
               <span className="shrink-0 rounded-full bg-zinc-100 px-2.5 py-1 text-xs font-medium text-zinc-700" title="Difficulty adapts to your quiz results: 1 = easiest, 5 = hardest.">
                 Level {header.level} / 5 · {header.styleLabel}
               </span>
             )}
             {header?.mockMode && <MockBadge />}
           </div>
-          {header && <ProgressBar current={header.stepNumber} completed={header.completedSteps} total={header.totalSteps} />}
+          {/* A topic test has no lesson steps, so no progress bar. */}
+          {header && header.totalSteps > 0 && <ProgressBar current={header.stepNumber} completed={header.completedSteps} total={header.totalSteps} />}
         </div>
       </header>
 
@@ -447,7 +449,9 @@ function SessionContent() {
 
           {view.kind === "step" && view.step.type === "done" && (
             <div>
-              <h2 className="mb-2 text-lg font-semibold text-zinc-900">Topic complete 🎉</h2>
+              <h2 className="mb-2 text-lg font-semibold text-zinc-900">
+                {view.step.totalSteps > 0 ? "Topic complete 🎉" : "Topic test complete"}
+              </h2>
               <p className="text-sm text-zinc-700">{view.step.message}</p>
               <div className="mt-6 flex gap-2">
                 <Link href={`/courses/${courseId}/learn`} className="rounded-lg bg-zinc-900 px-5 py-2.5 text-sm font-medium text-white hover:bg-zinc-700">

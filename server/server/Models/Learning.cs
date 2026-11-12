@@ -68,7 +68,10 @@ public class LearnSession
 {
     public int Id { get; set; }
     public int CourseId { get; set; }
+    /// <summary>0 for a mandatory topic test, which covers several topics.</summary>
     public int TopicId { get; set; }
+    /// <summary>"topic" = lessons on one topic, "test" = mandatory topic test.</summary>
+    public string Kind { get; set; } = "topic";
     public string Status { get; set; } = "active";
     public string Phase { get; set; } = "lesson";
     public int StepIndex { get; set; }
@@ -89,6 +92,10 @@ public class TopicListResponse
     public bool HasContent { get; set; }
     /// <summary>How many topics this call added from newly ingested documents.</summary>
     public int NewTopics { get; set; }
+    /// <summary>True when a mandatory topic test must be taken before starting another topic.</summary>
+    public bool TestDue { get; set; }
+    /// <summary>Titles of the completed topics the next topic test will cover.</summary>
+    public List<string> TestTopics { get; set; } = [];
     public List<Topic> Topics { get; set; } = [];
 }
 
@@ -120,7 +127,7 @@ public class LessonDto
 public class QuizDto
 {
     public int Id { get; set; }
-    public string Kind { get; set; } = "";          // lesson | checkpoint | retest
+    public string Kind { get; set; } = "";          // lesson | checkpoint | retest | topic_test
     public List<QuestionDto> Questions { get; set; } = [];
 }
 

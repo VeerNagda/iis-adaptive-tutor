@@ -14,6 +14,9 @@ CREATE TABLE IF NOT EXISTS courses (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     title       TEXT NOT NULL,
     description TEXT,
+    -- A mandatory topic test is due after this many completed topics: 2 or 3,
+    -- picked at random. 0 means not picked yet.
+    topic_test_every INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -67,7 +70,8 @@ CREATE TABLE IF NOT EXISTS document_sections (
 -- 5. Topics extracted from the sections by the LLM, plus the learner's state
 --    chunk_ids         JSON array of chunks.id the topic is taught from
 --    difficulty_level  1 (easiest) to 5 (hardest), starts at 3, remembered across sessions
---    status            new, learning, completed or weak
+--    status            new, learning, completed or weak (weak means it must be re-taught)
+--    awaiting_test     1 after the topic is completed, until a mandatory topic test covers it
 CREATE TABLE IF NOT EXISTS topics (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     course_id        INTEGER NOT NULL,
@@ -78,14 +82,18 @@ CREATE TABLE IF NOT EXISTS topics (
     difficulty_level INTEGER NOT NULL DEFAULT 3 CHECK (difficulty_level BETWEEN 1 AND 5),
     status           TEXT NOT NULL DEFAULT 'new'
         CHECK (status IN ('new', 'learning', 'completed', 'weak')),
+    awaiting_test    INTEGER NOT NULL DEFAULT 0,
     created_at       TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE,
     UNIQUE (course_id, sequence_number)
 );
 
--- 6. Learning sessions. One session teaches one topic, and the row stores the
---    position in the lesson loop so a refresh resumes at the same place.
---    phase             lesson, quiz, checkpoint, review, retest or done
+-- 6. Learning sessions. A 'topic' session teaches one topic, and the row stores
+--    the position in the lesson loop so a refresh resumes at the same place.
+--    A 'test' session is one mandatory topic test over several completed topics
+--    (current_topic_id is NULL for it).
+--    kind              topic or test
+--    phase             lesson, quiz, checkpoint, review, retest, test or done
 --    step_index        0-based lesson step within the topic
 --    attempt           1 for the first explanation of a step, 2 or more for a re-teach
 --    since_checkpoint  lessons completed since the last checkpoint test
@@ -97,6 +105,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     course_id        INTEGER NOT NULL,
     current_topic_id INTEGER,
+    kind             TEXT NOT NULL DEFAULT 'topic' CHECK (kind IN ('topic', 'test')),
     status           TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed')),
     phase            TEXT NOT NULL DEFAULT 'lesson',
     step_index       INTEGER NOT NULL DEFAULT 0,
@@ -132,7 +141,8 @@ CREATE TABLE IF NOT EXISTS learn_lessons (
 );
 
 -- 8. One row per quiz
---    kind is 'lesson' (after a lesson), 'checkpoint' (mixed test) or 'retest' (after a review)
+--    kind is 'lesson' (after a lesson), 'checkpoint' (mixed test inside a topic),
+--    'retest' (after a review) or 'topic_test' (mandatory test over several topics)
 --    correct and passed stay NULL until the learner submits answers
 CREATE TABLE IF NOT EXISTS learn_quizzes (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,7 +192,7 @@ CREATE TABLE IF NOT EXISTS difficulty_history (
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE SET NULL
 );
 
--- 11. Score per topic for each checkpoint or re-test (weak means below 60%)
+-- 11. Score per topic for each checkpoint, re-test or topic test (weak means below 60%)
 CREATE TABLE IF NOT EXISTS checkpoint_results (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     quiz_id    INTEGER NOT NULL,

@@ -66,6 +66,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 MockMode = MockMode,
                 HasContent = hasContent,
                 NewTopics = existingTopics > 0 ? added : 0,   // the first extraction is not "new topics"
+                TestDue = TopicTestDue(conn, courseId, out var awaiting),
+                TestTopics = awaiting.Select(t => t.Title).ToList(),
                 Topics = LoadTopics(conn, courseId),
             };
         }
@@ -89,6 +91,10 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             "SELECT id FROM sessions WHERE current_topic_id = $t AND status = 'active' ORDER BY id DESC LIMIT 1",
             ("$t", topicId));
         if (existing is not null) return Convert.ToInt32(existing);
+
+        // The topic test is mandatory: no new topic session until it has been taken.
+        if (TopicTestDue(conn, courseId, out _))
+            throw new LearningException("A mandatory topic test is due. Take it before starting another topic.");
 
         var id = Convert.ToInt32(Scalar(conn,
             "INSERT INTO sessions (course_id, current_topic_id, checkpoint_every) VALUES ($c, $t, $every) RETURNING id",
@@ -233,6 +239,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             using var conn = db.CreateConnection();
             var session = LoadSession(conn, courseId, sessionId);
             if (session is null) return null;
+            if (session.Kind == "test") return await GetTopicTestStepAsync(conn, session, ct);
+
             var topic = LoadTopic(conn, session.TopicId);
             int totalSteps = TotalSteps(topic);
 
@@ -346,7 +354,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         using var tx = conn.BeginTransaction();
 
         var session = LoadSession(conn, courseId, sessionId) ?? throw new LearningException("Session not found.");
-        var topic = LoadTopic(conn, session.TopicId);
+        // A mandatory topic test covers several topics, so it has no single topic.
+        var topic = session.Kind == "test" ? null : LoadTopic(conn, session.TopicId);
 
         var kind = Scalar(conn,
             "SELECT kind FROM learn_quizzes WHERE id = $q AND session_id = $s AND completed_at IS NULL",
@@ -367,8 +376,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         {
             Total = questions.Count,
             Simulated = request.SimulateWrong,
-            OldLevel = topic.DifficultyLevel,
-            NewLevel = topic.DifficultyLevel,
+            OldLevel = topic?.DifficultyLevel ?? 0,
+            NewLevel = topic?.DifficultyLevel ?? 0,
         };
         for (int i = 0; i < questions.Count; i++)
         {
@@ -394,7 +403,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         }
 
         // ── Decide ──
-        if (kind == "lesson") DecideAfterLessonQuiz(conn, session, topic, quizId, result);
+        if (topic is null) DecideAfterTopicTest(conn, session, quizId, questions, result);
+        else if (kind == "lesson") DecideAfterLessonQuiz(conn, session, topic, quizId, result);
         else if (kind == "checkpoint") DecideAfterCheckpoint(conn, session, topic, quizId, questions, result);
         else DecideAfterRetest(conn, session, topic, quizId, result);
 
@@ -784,20 +794,29 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     {
         int quizId = Convert.ToInt32(Scalar(conn, """
             INSERT INTO learn_quizzes (session_id, topic_id, lesson_id, kind, total)
-            VALUES ($s, $t, $l, $k, $n) RETURNING id
+            VALUES ($s, $t, $l, $k, 0) RETURNING id
             """,
-            ("$s", sessionId), ("$t", topicId), ("$l", lessonId), ("$k", kind), ("$n", questions.Count)));
+            ("$s", sessionId), ("$t", topicId), ("$l", lessonId), ("$k", kind)));
 
+        InsertQuestions(conn, quizId, topicId, questions);
+        return quizId;
+    }
+
+    /// <summary>Adds questions on one topic to a quiz and keeps the quiz's question count right.</summary>
+    private static void InsertQuestions(
+        SqliteConnection conn, int quizId, int topicId, List<LlmQuestion> questions, string? label = null)
+    {
         foreach (var q in questions)
             Exec(conn, """
-                INSERT INTO learn_questions (quiz_id, topic_id, text, options, correct_index, explanation, option_feedback)
-                VALUES ($q, $t, $text, $opts, $ci, $ex, $fb)
+                INSERT INTO learn_questions (quiz_id, topic_id, text, options, correct_index, explanation, option_feedback, label)
+                VALUES ($q, $t, $text, $opts, $ci, $ex, $fb, $label)
                 """,
                 ("$q", quizId), ("$t", topicId), ("$text", q.Text.Trim()),
                 ("$opts", JsonSerializer.Serialize(q.Options)), ("$ci", q.CorrectIndex), ("$ex", q.Explanation),
-                ("$fb", JsonSerializer.Serialize(q.OptionFeedback)));
+                ("$fb", JsonSerializer.Serialize(q.OptionFeedback)), ("$label", label));
 
-        return quizId;
+        Exec(conn, "UPDATE learn_quizzes SET total = (SELECT COUNT(*) FROM learn_questions WHERE quiz_id = $q) WHERE id = $q",
+            ("$q", quizId));
     }
 
     // ── Source text for a lesson step ─────────────────────────────────────────
@@ -833,8 +852,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             SELECT id, course_id, current_topic_id, status, phase, step_index, attempt,
-                   since_checkpoint, checkpoint_every, checkpoint_from, review_round, reason
-            FROM sessions WHERE id = $id AND course_id = $c AND current_topic_id IS NOT NULL
+                   since_checkpoint, checkpoint_every, checkpoint_from, review_round, reason, kind
+            FROM sessions WHERE id = $id AND course_id = $c
             """;
         cmd.Parameters.AddWithValue("$id", sessionId);
         cmd.Parameters.AddWithValue("$c", courseId);
@@ -844,7 +863,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         {
             Id = r.GetInt32(0),
             CourseId = r.GetInt32(1),
-            TopicId = r.GetInt32(2),
+            TopicId = r.IsDBNull(2) ? 0 : r.GetInt32(2),   // NULL for a topic test
             Status = r.GetString(3),
             Phase = r.GetString(4),
             StepIndex = r.GetInt32(5),
@@ -854,6 +873,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             CheckpointFrom = r.GetInt32(9),
             ReviewRound = r.GetInt32(10),
             Reason = r.IsDBNull(11) ? null : r.GetString(11),
+            Kind = r.GetString(12),
         };
     }
 
@@ -871,9 +891,13 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             ("$since", s.SinceCheckpoint), ("$every", s.CheckpointEvery), ("$from", s.CheckpointFrom),
             ("$round", s.ReviewRound), ("$reason", s.Reason), ("$id", s.Id));
 
-        // Keep the topic's status in step with the session (a weak topic stays weak).
-        if (s.Status == "completed")
+        // A finished topic session: keep the topic's status in step (a weak topic stays
+        // weak) and queue the topic for the next mandatory topic test.
+        if (s.Status == "completed" && s.Kind == "topic")
+        {
             Exec(conn, "UPDATE topics SET status = 'completed' WHERE id = $t AND status <> 'weak'", ("$t", s.TopicId));
+            Exec(conn, "UPDATE topics SET awaiting_test = 1 WHERE id = $t", ("$t", s.TopicId));
+        }
     }
 
     private static Topic LoadTopic(SqliteConnection conn, int topicId)
@@ -937,6 +961,175 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         return texts;
     }
 
+    // ══ Mandatory topic test ═════════════════════════════════════════════════
+    //
+    // The checkpoint above tests the lessons INSIDE one topic. This test sits one
+    // level higher: after the learner has completed 2-3 topics (picked at random)
+    // they must take one test across those topics before they can start another.
+    // A topic scoring below 60% is marked weak (= to be re-taught) and its level
+    // drops by 1, so it is taught more simply next time. A re-taught topic counts
+    // as completed again and is therefore covered by the following topic test.
+
+    /// <summary>New questions per topic in a topic test.</summary>
+    private const int TopicTestQuestions = 3;
+
+    /// <summary>
+    /// True when enough completed topics are waiting for a test. "awaiting" gets
+    /// those topics. The threshold (2 or 3) is stored on the course so it stays
+    /// the same until the test is taken.
+    /// </summary>
+    private static bool TopicTestDue(SqliteConnection conn, int courseId, out List<Topic> awaiting)
+    {
+        awaiting = [];
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT id FROM topics WHERE course_id = $c AND awaiting_test = 1 ORDER BY sequence_number";
+            cmd.Parameters.AddWithValue("$c", courseId);
+            var ids = new List<int>();
+            using (var r = cmd.ExecuteReader())
+                while (r.Read()) ids.Add(r.GetInt32(0));
+            var all = LoadTopics(conn, courseId);
+            awaiting = all.Where(t => ids.Contains(t.Id)).ToList();
+        }
+
+        int every = Convert.ToInt32(Scalar(conn, "SELECT topic_test_every FROM courses WHERE id = $c", ("$c", courseId)) ?? 0);
+        if (every == 0)
+        {
+            every = Random.Shared.Next(2, 4);   // 2 or 3
+            Exec(conn, "UPDATE courses SET topic_test_every = $n WHERE id = $c", ("$n", every), ("$c", courseId));
+        }
+        return awaiting.Count >= every;
+    }
+
+    /// <summary>Starts the mandatory topic test (or resumes the unfinished one). Returns the session id.</summary>
+    public int StartTopicTest(int courseId)
+    {
+        using var conn = db.CreateConnection();
+
+        var existing = Scalar(conn,
+            "SELECT id FROM sessions WHERE course_id = $c AND kind = 'test' AND status = 'active' ORDER BY id DESC LIMIT 1",
+            ("$c", courseId));
+        if (existing is not null) return Convert.ToInt32(existing);
+
+        if (!TopicTestDue(conn, courseId, out var awaiting))
+            throw new LearningException("No topic test is due yet.");
+
+        return Convert.ToInt32(Scalar(conn, """
+            INSERT INTO sessions (course_id, kind, phase, reason) VALUES ($c, 'test', 'test', $reason) RETURNING id
+            """,
+            ("$c", courseId),
+            ("$reason", $"Mandatory test: you completed {awaiting.Count} topics. "
+                + $"A topic scoring below {WeakBelowPct}% will be marked for re-teaching.")));
+    }
+
+    /// <summary>What a test session shows: the test itself, or the end screen.</summary>
+    private async Task<StepResponse> GetTopicTestStepAsync(SqliteConnection conn, LearnSession session, CancellationToken ct)
+    {
+        var step = new StepResponse
+        {
+            Phase = session.Phase,
+            MockMode = MockMode,
+            TopicTitle = "Mandatory topic test",
+            Reason = session.Reason,
+        };
+
+        if (session.Phase == "done")
+        {
+            step.Type = "done";
+            step.Message = session.Reason;   // the outcome, written by DecideAfterTopicTest
+            step.Reason = null;
+            return step;
+        }
+
+        var openQuizId = Scalar(conn,
+            "SELECT id FROM learn_quizzes WHERE session_id = $s AND kind = 'topic_test' AND completed_at IS NULL",
+            ("$s", session.Id));
+        int quizId = openQuizId is not null
+            ? Convert.ToInt32(openQuizId)
+            : await CreateTopicTestAsync(conn, session, ct);
+
+        step.Type = "quiz";
+        step.Quiz = LoadQuiz(conn, quizId);
+        return step;
+    }
+
+    /// <summary>
+    /// Builds the topic test: for every completed topic waiting for a test, the
+    /// LLM writes new questions from that topic's whole source text, at the
+    /// topic's current difficulty level. Each question is labelled with its topic.
+    /// </summary>
+    private async Task<int> CreateTopicTestAsync(SqliteConnection conn, LearnSession session, CancellationToken ct)
+    {
+        TopicTestDue(conn, session.CourseId, out var topics);
+        if (topics.Count == 0) throw new LearningException("There are no completed topics to test.");
+
+        // All LLM calls first, so a failure half-way stores nothing and can simply be retried.
+        var perTopic = new List<(Topic Topic, List<LlmQuestion> Questions)>();
+        foreach (var topic in topics)
+        {
+            var source = StepsSource(conn, topic, 0, TotalSteps(topic) - 1);
+            var reply = await AskAsync<LlmQuiz>(
+                Prompts.Checkpoint(topic.Title, source, topic.DifficultyLevel, TopicTestQuestions), ct);
+
+            var questions = ValidQuestions(reply.Questions).Take(TopicTestQuestions).ToList();
+            if (questions.Count < 2)
+                throw new LlmException("The AI returned an incomplete topic test. Please retry.");
+            perTopic.Add((topic, questions));
+        }
+
+        using var tx = conn.BeginTransaction();
+        // learn_quizzes needs one topic id. The first topic is used. What matters is
+        // the topic_id on each question, which is what the scoring groups by.
+        int quizId = InsertQuiz(conn, session.Id, topics[0].Id, null, "topic_test", []);
+        foreach (var (topic, questions) in perTopic)
+            InsertQuestions(conn, quizId, topic.Id, questions, $"Topic: {topic.Title}");
+        tx.Commit();
+        return quizId;
+    }
+
+    /// <summary>
+    /// After the topic test: score each topic, mark the ones below 60% to be
+    /// re-taught, and unlock the topic list again.
+    /// </summary>
+    private void DecideAfterTopicTest(
+        SqliteConnection conn, LearnSession session, int quizId, List<QuestionRow> questions, AnswerResult result)
+    {
+        var reteach = new List<string>();
+
+        // result.Questions is in the same order as questions, so the two can be paired up.
+        foreach (var group in questions.Zip(result.Questions).GroupBy(pair => pair.First.TopicId))
+        {
+            var topic = LoadTopic(conn, group.Key);
+            var score = RecordTopicScore(conn, session.Id, quizId, topic,
+                group.Count(pair => pair.Second.IsCorrect), group.Count());
+            result.TopicScores.Add(score);
+
+            if (score.IsWeak)
+            {
+                reteach.Add(topic.Title);
+                ChangeLevel(conn, topic, session.Id, -1,
+                    $"Scored {score.ScorePct}% in a mandatory topic test (below {WeakBelowPct}%)");
+            }
+            // Below 60%: to be re-taught. Otherwise the topic is confirmed as completed.
+            Exec(conn, "UPDATE topics SET status = $status, awaiting_test = 0 WHERE id = $t",
+                ("$status", score.IsWeak ? "weak" : "completed"), ("$t", topic.Id));
+        }
+
+        // Pick the gap to the next topic test: 2 or 3 completed topics.
+        Exec(conn, "UPDATE courses SET topic_test_every = $n WHERE id = $c",
+            ("$n", Random.Shared.Next(2, 4)), ("$c", session.CourseId));
+
+        result.Passed = reteach.Count == 0;
+        result.Decision = "done";
+        result.Message = result.Passed
+            ? "Well done, you passed every topic in this test."
+            : "These topics are marked to be re-taught at an easier level: " + string.Join(", ", reteach) + ".";
+
+        session.Phase = "done";
+        session.Status = "completed";
+        session.Reason = result.Message;   // shown again on the end screen
+    }
+
     // ══ History ══════════════════════════════════════════════════════════════
 
     /// <summary>
@@ -952,11 +1145,12 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = """
-                SELECT s.id, t.title, s.status, s.started_at, s.ended_at,
+                SELECT s.id, CASE WHEN s.kind = 'test' THEN 'Mandatory topic test' ELSE t.title END,
+                       s.status, s.started_at, s.ended_at,
                        (SELECT COUNT(*) FROM learn_lessons l WHERE l.session_id = s.id),
                        (SELECT COUNT(*) FROM learn_quizzes q WHERE q.session_id = s.id AND q.completed_at IS NOT NULL),
                        (SELECT COUNT(*) FROM learn_quizzes q WHERE q.session_id = s.id AND q.passed = 1)
-                FROM sessions s JOIN topics t ON t.id = s.current_topic_id
+                FROM sessions s LEFT JOIN topics t ON t.id = s.current_topic_id
                 WHERE s.course_id = $c
                 ORDER BY s.id DESC
                 """;
@@ -979,12 +1173,14 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         // ── Topics: status, current level, last checkpoint score, level changes ──
         foreach (var topic in LoadTopics(conn, courseId))
         {
-            // The topic's own last checkpoint or re-test (not the one or two refresher
-            // questions it may have contributed to another topic's checkpoint).
+            // The topic's last real test: its own checkpoint or re-test, or a mandatory
+            // topic test (not the one or two refresher questions it may have
+            // contributed to another topic's checkpoint).
             var lastPct = Scalar(conn, """
                 SELECT r.score_pct FROM checkpoint_results r
-                JOIN learn_quizzes q ON q.id = r.quiz_id AND q.topic_id = r.topic_id
-                WHERE r.topic_id = $t ORDER BY r.id DESC LIMIT 1
+                JOIN learn_quizzes q ON q.id = r.quiz_id
+                WHERE r.topic_id = $t AND (q.kind = 'topic_test' OR q.topic_id = r.topic_id)
+                ORDER BY r.id DESC LIMIT 1
                 """, ("$t", topic.Id));
 
             var progress = new TopicProgress

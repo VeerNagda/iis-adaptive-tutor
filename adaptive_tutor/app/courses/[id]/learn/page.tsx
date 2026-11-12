@@ -21,6 +21,8 @@ type TopicList = {
   mockMode: boolean;
   hasContent: boolean;
   newTopics: number; // topics just added from newly ingested files
+  testDue: boolean; // a mandatory topic test must be taken before another topic
+  testTopics: string[]; // titles of the completed topics the test will cover
   topics: Topic[];
 };
 
@@ -37,7 +39,7 @@ const TOPIC_STATUS: Record<Topic["status"], { label: string; cls: string; action
   new: { label: "Not started", cls: "bg-zinc-100 text-zinc-600", action: "Start" },
   learning: { label: "In progress", cls: "bg-blue-100 text-blue-700", action: "Continue" },
   completed: { label: "Completed", cls: "bg-green-100 text-green-700", action: "Learn again" },
-  weak: { label: "Weak: review recommended", cls: "bg-amber-100 text-amber-800", action: "Review" },
+  weak: { label: "Needs re-teaching", cls: "bg-amber-100 text-amber-800", action: "Re-learn" },
 };
 
 // ─── Materials: the uploaded files the topics are extracted from ─────────────
@@ -210,6 +212,17 @@ function TopicsPanel({ courseId, onMockMode }: { courseId: string; onMockMode: (
     }
   }
 
+  async function startTest() {
+    setStartingId(-1);
+    try {
+      const session = await apiService.post<{ id: number }>(`/courses/${courseId}/topic-test`, {});
+      router.push(`/courses/${courseId}/learn/${session.id}`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not start the test.");
+      setStartingId(null);
+    }
+  }
+
   return (
     <section className="rounded-2xl border border-zinc-200 bg-white p-6">
       <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Topics</h2>
@@ -230,6 +243,24 @@ function TopicsPanel({ courseId, onMockMode }: { courseId: string; onMockMode: (
           <p>{error}</p>
           <button onClick={retry} className="mt-2 rounded-lg border border-red-300 px-3 py-1 text-xs font-medium hover:bg-red-100">
             Retry
+          </button>
+        </div>
+      )}
+
+      {/* Mandatory topic test: the topic buttons stay locked until it is taken. */}
+      {!loading && !error && data && data.testDue && (
+        <div className="mb-4 rounded-xl border border-purple-200 bg-purple-50 px-4 py-3">
+          <p className="text-sm font-semibold text-purple-900">Mandatory topic test</p>
+          <p className="mt-1 text-xs text-purple-800">
+            You completed {data.testTopics.length} topics ({data.testTopics.join(", ")}). Take a short test on them
+            before starting another topic. Topics scoring below 60% will be marked for re-teaching.
+          </p>
+          <button
+            onClick={startTest}
+            disabled={startingId !== null}
+            className="mt-3 rounded-lg bg-purple-700 px-4 py-2 text-xs font-medium text-white hover:bg-purple-600 disabled:opacity-50"
+          >
+            {startingId === -1 ? "Starting…" : "Take the test"}
           </button>
         </div>
       )}
@@ -259,7 +290,8 @@ function TopicsPanel({ courseId, onMockMode }: { courseId: string; onMockMode: (
                   </div>
                   <button
                     onClick={() => start(topic.id)}
-                    disabled={startingId !== null}
+                    disabled={startingId !== null || data.testDue}
+                    title={data.testDue ? "Take the mandatory topic test first." : undefined}
                     className="shrink-0 rounded-lg bg-zinc-900 px-4 py-2 text-xs font-medium text-white hover:bg-zinc-700 disabled:opacity-50"
                   >
                     {startingId === topic.id ? "Starting…" : status.action}
