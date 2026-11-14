@@ -173,6 +173,7 @@ CREATE TABLE IF NOT EXISTS learn_questions (
     correct_index INTEGER NOT NULL,   -- 0-based position of the correct option
     explanation   TEXT,               -- why the correct option is right
     option_feedback TEXT,             -- JSON array, one sentence per option: why it is right or wrong
+    source_quote  TEXT,               -- words of the learner's notes the answer is based on (checked in C#)
     label         TEXT,               -- for example "Refresher from: Topic X"
     user_answer   INTEGER,
     is_correct    INTEGER,

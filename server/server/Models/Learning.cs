@@ -53,12 +53,28 @@ public class LlmQuestion
     /// option is right or wrong. Lets the app explain a mistake without another LLM call.
     /// </summary>
     [JsonPropertyName("option_feedback")] public List<string> OptionFeedback { get; set; } = [];
+    /// <summary>
+    /// The words of the learner's notes the correct answer is based on. A question
+    /// whose quote cannot be found in the notes is rejected (LearningService.QuoteFound).
+    /// </summary>
+    [JsonPropertyName("source_quote")] public string? SourceQuote { get; set; }
 }
 
 /// <summary>The tutor's answer to a question the learner asked about a lesson.</summary>
 public class LlmAnswer
 {
-    [JsonPropertyName("answer")] public string Answer { get; set; } = "";
+    /// <summary>Where the model says the answer comes from: "notes", "general" or "none".</summary>
+    [JsonPropertyName("source")] public string Source { get; set; } = "";
+    /// <summary>For "notes": words copied from a passage. Checked in C# before it is believed.</summary>
+    [JsonPropertyName("source_quote")] public string? SourceQuote { get; set; }
+    /// <summary>
+    /// The model's own idea of the file and page. Only kept for comparison: what is
+    /// shown comes from the passage in which C# actually found the quote. (page is
+    /// read loosely because a model may write 3, "3" or "3-5".)
+    /// </summary>
+    [JsonPropertyName("file_name")] public string? FileName { get; set; }
+    [JsonPropertyName("page")] public System.Text.Json.JsonElement? Page { get; set; }
+    [JsonPropertyName("answer")] public string? Answer { get; set; }
 }
 
 // ══ 2. Database rows used by LearningService ═════════════════════════════════
@@ -163,6 +179,11 @@ public class AskRequest
     /// the chat and sends it back, because the LLM has no memory between calls.
     /// </summary>
     public List<ChatTurn> History { get; set; } = [];
+    /// <summary>
+    /// True only when the learner pressed "Answer from general knowledge anyway"
+    /// after being told the notes do not cover the question.
+    /// </summary>
+    public bool AllowGeneral { get; set; }
 }
 
 public class ChatTurn
@@ -171,9 +192,26 @@ public class ChatTurn
     public string Answer { get; set; } = "";
 }
 
+/// <summary>
+/// A chat answer with where it comes from. Source is decided in C#, not taken
+/// from the model: "notes" only when the quote was found in a passage.
+/// </summary>
 public class AskResponse
 {
     public string Answer { get; set; } = "";
+    /// <summary>"notes", "general" or "none".</summary>
+    public string Source { get; set; } = "";
+    /// <summary>The badge text for this source (a fixed C# constant).</summary>
+    public string Label { get; set; } = "";
+    // Filled only for "notes": the quote and where it was found.
+    public string? SourceQuote { get; set; }
+    public string? FileName { get; set; }
+    public string? PageLabel { get; set; }
+    public string? UploadedAt { get; set; }
+    /// <summary>True when the quote is from the AI's description of a picture, not the author's own words.</summary>
+    public bool FromPictureDescription { get; set; }
+    /// <summary>True when "Answer from general knowledge anyway" should be offered.</summary>
+    public bool CanAskGeneral { get; set; }
 }
 
 public class SubmitAnswersRequest
@@ -209,6 +247,8 @@ public class QuestionFeedback
     public string? Explanation { get; set; }
     /// <summary>Only for a wrong answer: why the option the learner picked is wrong.</summary>
     public string? WhatWentWrong { get; set; }
+    /// <summary>The words of the learner's notes the question is based on ("From your notes: ...").</summary>
+    public string? SourceQuote { get; set; }
 }
 
 public class TopicScore

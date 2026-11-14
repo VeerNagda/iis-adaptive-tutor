@@ -44,6 +44,7 @@ type AnswerResult = {
     isCorrect: boolean;
     explanation: string | null; // why the correct option is right
     whatWentWrong: string | null; // why the option the learner picked is wrong
+    sourceQuote: string | null; // the words of the notes the question is based on
   }[];
   topicScores: { topicId: number; topicTitle: string; correct: number; total: number; scorePct: number; isWeak: boolean }[];
 };
@@ -101,7 +102,33 @@ function ReasonLabel({ text }: { text: string }) {
 // The chat lives only in this component: the server answers each question from
 // the lesson and the uploaded material, and is sent the earlier turns so that
 // follow-up questions make sense. Asking never changes the difficulty level.
-type ChatTurn = { question: string; answer: string };
+//
+// Every answer carries a label saying where it comes from. The server decides
+// the label: "notes" only when it found the quote in the uploaded material.
+type ChatAnswer = {
+  answer: string;
+  source: "notes" | "general" | "none";
+  label: string; // badge text, written by the server
+  sourceQuote: string | null;
+  fileName: string | null;
+  pageLabel: string | null;
+  uploadedAt: string | null;
+  fromPictureDescription: boolean;
+  canAskGeneral: boolean;
+};
+type ChatTurn = ChatAnswer & { question: string };
+
+const SOURCE_STYLE: Record<ChatAnswer["source"], string> = {
+  notes: "bg-green-100 text-green-800",
+  general: "bg-amber-100 text-amber-900",
+  none: "bg-zinc-200 text-zinc-700",
+};
+
+// SQLite stores UTC timestamps as "YYYY-MM-DD HH:MM:SS"; show the local date.
+function formatDate(raw: string) {
+  const d = new Date(raw.replace(" ", "T") + "Z");
+  return isNaN(d.getTime()) ? raw : d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
 
 function LessonChat({ askUrl, disabled }: { askUrl: string; disabled: boolean }) {
   const [turns, setTurns] = useState<ChatTurn[]>([]);
@@ -109,16 +136,19 @@ function LessonChat({ askUrl, disabled }: { askUrl: string; disabled: boolean })
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function ask(e: FormEvent) {
-    e.preventDefault();
-    const question = draft.trim();
+  // allowGeneral is only true when the learner pressed "Answer from general
+  // knowledge anyway" on a question the notes did not cover; that answer then
+  // replaces the "couldn't find this" turn.
+  async function send(question: string, allowGeneral: boolean, replaceIndex?: number) {
     if (!question || asking) return;
     setAsking(true);
     setError(null);
     try {
-      const { answer } = await apiService.post<{ answer: string }>(askUrl, { question, history: turns });
-      setTurns((prev) => [...prev, { question, answer }]);
-      setDraft("");
+      const history = turns.map((t) => ({ question: t.question, answer: t.answer }));
+      const reply = await apiService.post<ChatAnswer>(askUrl, { question, history, allowGeneral });
+      const turn = { question, ...reply };
+      setTurns((prev) => (replaceIndex === undefined ? [...prev, turn] : prev.map((t, i) => (i === replaceIndex ? turn : t))));
+      if (replaceIndex === undefined) setDraft("");
     } catch (err) {
       // The question stays in the box so it can be sent again.
       setError(err instanceof Error ? err.message : "Something went wrong.");
@@ -127,11 +157,16 @@ function LessonChat({ askUrl, disabled }: { askUrl: string; disabled: boolean })
     }
   }
 
+  function ask(e: FormEvent) {
+    e.preventDefault();
+    send(draft.trim(), false);
+  }
+
   return (
     <div className="mt-6 rounded-xl border border-zinc-200 p-4">
       <p className="text-sm font-semibold text-zinc-900">Have a doubt? Ask the tutor</p>
       <p className="mt-0.5 text-xs text-zinc-500">
-        Answers come from this lesson and your uploaded material. Asking does not affect your difficulty level.
+        Every answer says where it comes from. Asking does not affect your difficulty level.
       </p>
 
       {turns.length > 0 && (
@@ -139,7 +174,36 @@ function LessonChat({ askUrl, disabled }: { askUrl: string; disabled: boolean })
           {turns.map((t, i) => (
             <li key={i} className="space-y-1.5 text-sm">
               <p className="ml-8 rounded-lg bg-zinc-900 px-3 py-2 text-white">{t.question}</p>
-              <p className="mr-8 whitespace-pre-wrap rounded-lg bg-zinc-100 px-3 py-2 leading-relaxed text-zinc-800">{t.answer}</p>
+              <div className="mr-8 rounded-lg bg-zinc-100 px-3 py-2">
+                <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-semibold ${SOURCE_STYLE[t.source] ?? SOURCE_STYLE.none}`}>
+                  {t.label}
+                </span>
+                {t.answer && <p className="mt-1.5 whitespace-pre-wrap leading-relaxed text-zinc-800">{t.answer}</p>}
+                {/* Provenance shown beside the answer, not only cited: the quote, file, page and upload date. */}
+                {t.source === "notes" && t.sourceQuote && (
+                  <blockquote className="mt-2 border-l-2 border-green-400 pl-3 text-xs leading-relaxed text-zinc-600">
+                    <p>“{t.sourceQuote}”</p>
+                    <p className="mt-1 text-zinc-500">
+                      {t.fileName} · {t.pageLabel}
+                      {t.uploadedAt && ` · uploaded ${formatDate(t.uploadedAt)}`}
+                    </p>
+                    {t.fromPictureDescription && (
+                      <p className="mt-1 text-amber-800">
+                        This quote is the tutor&apos;s own description of a picture in your notes, not the picture itself.
+                      </p>
+                    )}
+                  </blockquote>
+                )}
+                {t.canAskGeneral && (
+                  <button
+                    onClick={() => send(t.question, true, i)}
+                    disabled={disabled || asking}
+                    className="mt-2 rounded-lg border border-zinc-300 bg-white px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+                  >
+                    Answer from general knowledge anyway
+                  </button>
+                )}
+              </div>
             </li>
           ))}
         </ul>
@@ -388,6 +452,12 @@ function FeedbackView({ step, result, busy, onNext }: { step: Step; result: Answ
               )}
               {!fb.isCorrect && <p className="text-zinc-700">Correct answer: {q.options[fb.correctIndex]}</p>}
               {fb.explanation && <p className="mt-2 text-zinc-500">{fb.explanation}</p>}
+              {/* The words of the uploaded notes the question rests on (checked by the server). */}
+              {fb.sourceQuote && (
+                <p className="mt-2 border-l-2 border-green-400 pl-3 text-xs text-zinc-600">
+                  <span className="font-semibold">From your notes: </span>“{fb.sourceQuote}”
+                </p>
+              )}
             </li>
           );
         })}

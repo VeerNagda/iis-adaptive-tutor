@@ -98,7 +98,7 @@ public sealed class MockLlmProvider : ILlmProvider
             lesson_text = lessonText,
             example = "(MOCK example) A real LLM would give one concrete example or analogy here.",
             insight = "(MOCK insight) A real LLM would add one extra interesting point from the material.",
-            questions = MockQuestions(title, Prompts.QuizSize)
+            questions = MockQuestions(title, Prompts.QuizSize, SourceExcerpt(prompt, 10))
         });
     }
 
@@ -107,17 +107,51 @@ public sealed class MockLlmProvider : ILlmProvider
     {
         var title = Regex.Match(prompt, "topic \"(.+?)\"").Groups[1].Value;
         int count = int.Parse(Regex.Match(prompt, @"exactly (\d+)").Groups[1].Value);
-        return JsonSerializer.Serialize(new { questions = MockQuestions(title, count) });
+        return JsonSerializer.Serialize(new { questions = MockQuestions(title, count, SourceExcerpt(prompt, 10)) });
     }
 
     // ── Ask the tutor: echoes the question so the chat is visibly working ─────
+    //
+    // Normally it answers "from the notes" with a real quote: the first words of
+    // the first passage, so the C# quote check passes. Two trigger words in the
+    // question make the other paths demonstrable without a real model:
+    //   "outside"     the notes do not cover it: source "none", or a general
+    //                 answer once the learner has allowed general knowledge;
+    //   "wrongquote"  claims "notes" with a quote that is not in the notes, so
+    //                 the C# check lowers the label to general knowledge.
+    public const string MockOutsideWord = "outside";
+    public const string MockWrongQuoteWord = "wrongquote";
+
     private static string MockAnswer(string prompt)
     {
         var question = Regex.Match(prompt, @"<<<QUESTION\s*(.*?)\s*QUESTION>>>", RegexOptions.Singleline).Groups[1].Value;
+        var passage = Regex.Match(prompt, @"\[PASSAGE 1 \| file: (.+?) \| (.+?)\]\s*(.*?)\s*(\[PASSAGE 2|PASSAGES>>>)", RegexOptions.Singleline);
+        int.TryParse(Regex.Match(passage.Groups[2].Value, @"\d+").Value, out int page);
+        string realQuote = string.Join(" ", passage.Groups[3].Value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Take(12));
+        string lower = question.ToLowerInvariant();
+
+        if (lower.Contains(MockOutsideWord))
+        {
+            return prompt.Contains(Prompts.GeneralAllowed)
+                ? JsonSerializer.Serialize(new
+                {
+                    source = "general", source_quote = "", file_name = "", page = 0,
+                    answer = $"(MOCK general-knowledge answer) You asked: \"{question}\". A real LLM would answer this from "
+                        + "what it knows in general, because your notes do not cover it.",
+                })
+                : JsonSerializer.Serialize(new { source = "none", source_quote = "", file_name = "", page = 0, answer = "" });
+        }
+
         return JsonSerializer.Serialize(new
         {
+            source = "notes",
+            source_quote = lower.Contains(MockWrongQuoteWord)
+                ? "This sentence was made up by the mock and is not anywhere in your notes."
+                : realQuote,
+            file_name = passage.Groups[1].Value,
+            page,
             answer = $"(MOCK answer) You asked: \"{question}\". A real LLM would answer this here, "
-                + "using only the lesson and the uploaded material."
+                + "using only the passages from your notes.",
         });
     }
 
@@ -131,8 +165,10 @@ public sealed class MockLlmProvider : ILlmProvider
     /// <summary>
     /// Canned questions. A random set number makes every quiz "new" (as a real
     /// re-quiz would be), and the correct option moves between questions.
+    /// sourceQuote is a real piece of the source text, so the questions pass the
+    /// C# check that every question quotes the learner's notes.
     /// </summary>
-    private static object[] MockQuestions(string title, int count)
+    private static object[] MockQuestions(string title, int count, string sourceQuote)
     {
         int set = Random.Shared.Next(100, 999);
         return Enumerable.Range(0, count).Select(i =>
@@ -150,7 +186,8 @@ public sealed class MockLlmProvider : ILlmProvider
                     .Select(o => o == correct
                         ? "(MOCK) This option is right."
                         : $"(MOCK) Option {(char)('A' + o)} is wrong: a real LLM would name the misunderstanding behind it here.")
-                    .ToArray()
+                    .ToArray(),
+                source_quote = sourceQuote,
             };
         }).ToArray();
     }

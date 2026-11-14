@@ -61,10 +61,28 @@ public static class Capability
     public static string RejectReason(string extension) =>
         RejectReasons.GetValueOrDefault(extension.ToLowerInvariant(), OtherFileReason);
 
+    // ── Where a chat answer comes from (the badge beside every answer) ────────
+
+    public const string FromNotes = "From your notes";
+    public const string GeneralKnowledge = "Not in your notes: general knowledge, check it yourself";
+    public const string NotFound = "I couldn't find this in your material.";
+    public const string AskGeneralAnyway = "Answer from general knowledge anyway";
+
+    public static string SourceLabel(string source) => source switch
+    {
+        "notes" => FromNotes,
+        "general" => GeneralKnowledge,
+        _ => NotFound,
+    };
+
     // ── Event log (evidence for the report) ───────────────────────────────────
 
     public const string UploadRejected = "upload_rejected";
     public const string ScopeWarning = "scope_warning";
+    /// <summary>The model said "from the notes" but its quote was not in them, so the label was lowered.</summary>
+    public const string SourceDowngrade = "source_downgrade";
+    /// <summary>The notes had no answer and the learner asked for a general-knowledge one.</summary>
+    public const string GeneralAnswer = "general_answer";
 
     /// <summary>Event types the browser may log itself (a choice the server never sees, such as "Cancel").</summary>
     public static readonly string[] ClientEvents = [ScopeWarning];

@@ -29,12 +29,19 @@ public static class Prompts
     // option_feedback is what lets the app tell a learner WHY their wrong answer
     // was wrong: the reason for every option is written together with the
     // question, stored, and shown later without a second LLM call.
+    //
+    // source_quote is the question's evidence: the words in the learner's own
+    // notes that the correct answer rests on. Asking for it is only an
+    // instruction; LearningService checks in C# that the quote really appears in
+    // SOURCE and rejects the question if it does not (see QuoteFound).
     private const string QuestionShape =
-        """{"text":"...","options":["...","...","...","..."],"correct_index":0,"explanation":"...","option_feedback":["...","...","...","..."]}""";
+        """{"text":"...","options":["...","...","...","..."],"correct_index":0,"explanation":"...","option_feedback":["...","...","...","..."],"source_quote":"..."}""";
 
     private const string QuestionRules =
         "Each question has 4 options with exactly one correct and plausible wrong options. "
         + "explanation: 1-2 sentences on why the correct option is right. "
+        + "source_quote: one sentence or phrase of at least 5 words copied word for word, with no changes, "
+        + "from SOURCE, that shows the correct answer is right. "
         + "option_feedback: one short sentence per option, in the same order as options. For a wrong "
         + "option, name the misunderstanding behind it and say why it is wrong; for the correct option, say why it is right. "
         + "correct_index is the 0-based position of the correct option; vary it between questions.";
@@ -206,31 +213,62 @@ public static class Prompts
     // again each time:
     //   lessonText  the explanation the learner is looking at (so "what do you
     //               mean by X?" can be answered about the actual wording);
-    //   source      the same uploaded text the lesson was written from, which
-    //               keeps the answer grounded in the learner's own material;
+    //   passages    the chunks of the learner's notes behind this lesson, each
+    //               with a header naming its file and pages;
     //   history     the earlier questions and answers of this chat, so a
     //               follow-up such as "why?" makes sense;
     //   level       the same teaching style as the lesson (StyleForLevel).
-    // The reply is JSON with one field, like every other prompt, so it goes
-    // through the same parsing and error handling. Asking a question never
-    // changes the difficulty level: that is decided only by quiz results.
+    //
+    // Provenance. A fluent answer looks equally sure whether it comes from the
+    // notes or from the model's general knowledge, so the reply must say which:
+    //   source        "notes", "general" or "none"
+    //   source_quote  for "notes": the exact words of the notes it rests on
+    //   file_name, page  where that quote is
+    // "Answer only from the passages" is an instruction, not a mechanism: the
+    // model can still claim "notes" for something it made up. So C# checks that
+    // source_quote really occurs in a passage (LearningService.AskQuestionAsync)
+    // and only then shows "From your notes", taking the file and page from the
+    // passage it found the quote in, not from the model's word.
+    //
+    // allowGeneral is false on the first ask: if the notes have no answer the
+    // model must say "none" and the learner decides whether to ask for a
+    // general-knowledge answer, which is then labelled as such.
+    //
+    // Asking a question never changes the difficulty level: that is decided
+    // only by quiz results.
+    public const string GeneralAllowed = "GENERAL KNOWLEDGE: allowed";
+    public const string GeneralNotAllowed = "GENERAL KNOWLEDGE: not allowed";
+
     public static string Ask(
-        string topicTitle, string source, int level, string lessonText,
-        IReadOnlyList<(string Question, string Answer)> history, string question)
+        string topicTitle, string passages, int level, string lessonText,
+        IReadOnlyList<(string Question, string Answer)> history, string question, bool allowGeneral)
     {
         var earlier = history.Count == 0
             ? "none"
             : string.Join("\n", history.Select(h => $"Learner: {h.Question}\nTutor: {h.Answer}"));
+
+        var notCovered = allowGeneral
+            ? """set "source" to "general", leave "source_quote" empty, and answer from general knowledge."""
+            : """set "source" to "none" and leave "answer" and "source_quote" empty. Do not answer from general knowledge.""";
 
         return $$"""
             {{AskTask}}
             You are a patient tutor. The learner has just read the LESSON below, part of the
             topic "{{topicTitle}}", and has a question about it before taking the quiz.
 
-            Answer the QUESTION directly in at most 120 words.
-            GROUNDING: use only facts found in SOURCE and LESSON. Do not add outside knowledge.
-            If they do not cover the question, say that the uploaded material does not cover it
-            and point the learner to the closest idea that it does cover.
+            PASSAGES are taken from the learner's own uploaded notes. Each one starts with a
+            header that names its file and pages.
+
+            {{(allowGeneral ? GeneralAllowed : GeneralNotAllowed)}}
+            How to answer the QUESTION:
+            1. If PASSAGES answer it: set "source" to "notes" and answer using only facts found in
+               PASSAGES. Copy into "source_quote" one sentence or phrase of at least 5 words, word
+               for word with no changes, from the passage your answer rests on. Set "file_name" and
+               "page" from the header of that passage.
+            2. If PASSAGES do not answer it: {{notCovered}}
+            Never present general knowledge as coming from the notes.
+
+            Keep the answer to at most 120 words.
             Do not write quiz questions and do not reveal quiz answers.
 
             DIFFICULTY LEVEL: {{level}} of 5 (1 = easiest, 5 = hardest)
@@ -238,11 +276,11 @@ public static class Prompts
             {{StyleForLevel(level)}}
 
             Return JSON only, in exactly this shape:
-            {"answer":"..."}
+            {"source":"notes","source_quote":"...","file_name":"...","page":1,"answer":"..."}
 
-            <<<SOURCE
-            {{source}}
-            SOURCE>>>
+            <<<PASSAGES
+            {{passages}}
+            PASSAGES>>>
 
             LESSON:
             {{lessonText}}

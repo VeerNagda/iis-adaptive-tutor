@@ -367,21 +367,154 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 ? FindLesson(conn, session.Id, "review", session.CheckpointFrom, session.ReviewRound)
                 : FindLesson(conn, session.Id, "lesson", session.StepIndex, session.Attempt))
             ?? throw new LearningException("There is no lesson to ask about yet.");
-        var source = isReview
-            ? StepsSource(conn, topic, session.CheckpointFrom, session.StepIndex - 1)
-            : StepsSource(conn, topic, session.StepIndex, session.StepIndex);
+
+        // The chunks of the learner's notes behind this lesson, each with its file and pages.
+        var passages = isReview
+            ? StepPassages(conn, topic, session.CheckpointFrom, session.StepIndex - 1)
+            : StepPassages(conn, topic, session.StepIndex, session.StepIndex);
+        if (passages.Count == 0)
+            throw new LearningException("The source text for this lesson is missing. Was the document removed?");
+        var passageText = string.Join("\n\n", passages.Select((p, i) =>
+            $"[PASSAGE {i + 1} | file: {p.FileName} | {p.PageLabel}]\n{p.Text}"));
 
         var history = request.History
+            .Where(t => !string.IsNullOrWhiteSpace(t.Answer))
             .TakeLast(MaxChatTurns)
             .Select(t => (t.Question, t.Answer))
             .ToList();
 
         var reply = await AskAsync<LlmAnswer>(
-            Prompts.Ask(topic.Title, source, topic.DifficultyLevel, lesson.Text, history, question), ct);
-        if (string.IsNullOrWhiteSpace(reply.Answer))
-            throw new LlmException("The AI returned an empty answer. Please ask again.");
+            Prompts.Ask(topic.Title, passageText, topic.DifficultyLevel, lesson.Text, history, question, request.AllowGeneral), ct);
 
-        return new AskResponse { Answer = reply.Answer.Trim() };
+        return LabelAnswer(conn, session.CourseId, reply, passages, request.AllowGeneral);
+    }
+
+    /// <summary>
+    /// Decides where a chat answer comes from. The model's own "source" is only a
+    /// claim; the label shown to the learner follows these rules:
+    ///   "notes"   only if the model's quote is really found in one of the passages
+    ///             (the file, pages and upload date are then taken from that passage);
+    ///   "general" if the model claimed "notes" but the quote is not there (the
+    ///             label is lowered and the event logged), or if the learner asked
+    ///             for a general-knowledge answer;
+    ///   "none"    otherwise: no answer is shown, and the learner is offered
+    ///             "Answer from general knowledge anyway".
+    /// </summary>
+    private AskResponse LabelAnswer(
+        SqliteConnection conn, int courseId, LlmAnswer reply, List<Passage> passages, bool allowGeneral)
+    {
+        string answer = reply.Answer?.Trim() ?? "";
+        bool claimsNotes = reply.Source == "notes" && answer.Length > 0;
+        var found = claimsNotes ? passages.FirstOrDefault(p => QuoteFound(p.Text, reply.SourceQuote)) : null;
+
+        string source =
+            found is not null ? "notes" :
+            claimsNotes ? "general" :
+            allowGeneral && answer.Length > 0 ? "general" :
+            "none";
+
+        if (claimsNotes && found is null)
+        {
+            log.LogWarning("Chat answer claimed the notes but its quote was not found: {Quote}", reply.SourceQuote);
+            Capability.Log(conn, courseId, Capability.SourceDowngrade, Capability.GeneralKnowledge, null);
+        }
+        if (allowGeneral)
+            Capability.Log(conn, courseId, Capability.GeneralAnswer, Capability.SourceLabel(source), Capability.AskGeneralAnyway);
+
+        return new AskResponse
+        {
+            Answer = source == "none" ? "" : answer,
+            Source = source,
+            Label = Capability.SourceLabel(source),
+            SourceQuote = found is null ? null : reply.SourceQuote!.Trim(),
+            FileName = found?.FileName,
+            PageLabel = found?.PageLabel,
+            UploadedAt = found?.UploadedAt,
+            // A picture's description sits in the notes' text but was written by the
+            // AI at ingestion, so a quote from one is marked as such.
+            FromPictureDescription = found is not null && Regex.Matches(found.Text, @"\[Image on this page:.*?\]")
+                .Any(m => QuoteFound(m.Value, reply.SourceQuote)),
+            CanAskGeneral = source == "none" && !allowGeneral,
+        };
+    }
+
+    // ── Provenance: checking that a quote really is in the notes ──────────────
+
+    /// <summary>A shorter "quote" could match by accident (for example "the system").</summary>
+    private const int MinQuoteChars = 20;
+    /// <summary>Upper limit on the text of the passages sent with one chat question.</summary>
+    private const int MaxPassageChars = 9000;
+
+    /// <summary>
+    /// Lower case, letters and digits only, single spaces. Text extracted from a
+    /// PDF differs from a careful copy in line breaks, hyphens and quote marks, so
+    /// both sides are reduced to this form before comparing.
+    /// </summary>
+    private static string Normalize(string text) =>
+        Regex.Replace(text.ToLowerInvariant(), @"[^\p{L}\p{N}]+", " ").Trim();
+
+    /// <summary>True if the quote is long enough and occurs in the source text.</summary>
+    private static bool QuoteFound(string source, string? quote)
+    {
+        var q = Normalize(quote ?? "");
+        return q.Length >= MinQuoteChars && Normalize(source).Contains(q);
+    }
+
+    /// <summary>One chunk of the learner's notes with the file and pages it came from.</summary>
+    private sealed record Passage(string FileName, string FileType, int? PageStart, int? PageEnd, string UploadedAt, string Text)
+    {
+        public string PageLabel
+        {
+            get
+            {
+                string unit = FileType == "pptx" ? "slide" : "page";
+                if (PageStart is null) return $"{unit} unknown";
+                return PageEnd is null || PageEnd == PageStart ? $"{unit} {PageStart}" : $"{unit}s {PageStart}-{PageEnd}";
+            }
+        }
+    }
+
+    /// <summary>
+    /// The chunks that lesson steps fromStep..toStep draw on. The steps divide the
+    /// topic's text evenly (see StepsSource), so a chunk belongs to a step when
+    /// their positions in that text overlap.
+    /// </summary>
+    private static List<Passage> StepPassages(SqliteConnection conn, Topic topic, int fromStep, int toStep)
+    {
+        var all = new List<Passage>();
+        foreach (var id in topic.ChunkIds)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                SELECT d.filename, d.file_type, c.page_start, c.page_end, d.uploaded_at, c.text
+                FROM chunks c JOIN documents d ON d.id = c.document_id WHERE c.id = $id
+                """;
+            cmd.Parameters.AddWithValue("$id", id);
+            using var r = cmd.ExecuteReader();
+            if (r.Read() && !string.IsNullOrWhiteSpace(r.GetString(5)))
+                all.Add(new Passage(r.GetString(0), r.GetString(1),
+                    r.IsDBNull(2) ? null : r.GetInt32(2), r.IsDBNull(3) ? null : r.GetInt32(3),
+                    r.GetString(4), r.GetString(5)));
+        }
+
+        int steps = TotalSteps(topic);
+        long total = all.Sum(p => (long)p.Text.Length);
+        long from = fromStep * total / steps, to = (toStep + 1) * total / steps;
+
+        var picked = new List<Passage>();
+        long position = 0;
+        int chars = 0;
+        foreach (var passage in all)
+        {
+            long start = position, end = position + passage.Text.Length;
+            position = end;
+            if (end > from && start < to && chars < MaxPassageChars)
+            {
+                picked.Add(passage);
+                chars += passage.Text.Length;
+            }
+        }
+        return picked;
     }
 
     /// <summary>"Skip / I know this": move on without taking the quiz.</summary>
@@ -451,6 +584,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 WhatWentWrong = !isCorrect && answers[i] >= 0 && answers[i] < q.OptionFeedback.Count
                     ? q.OptionFeedback[answers[i]]
                     : null,
+                SourceQuote = q.SourceQuote,
             });
         }
 
@@ -580,10 +714,10 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         SqliteConnection conn, LearnSession session, Topic topic, CancellationToken ct)
     {
         var source = StepsSource(conn, topic, session.CheckpointFrom, session.StepIndex - 1);
-        var reply = await AskAsync<LlmQuiz>(
-            Prompts.Checkpoint(topic.Title, source, topic.DifficultyLevel, CheckpointQuestions), ct);
+        var (_, questions) = await AskForQuestionsAsync<LlmQuiz>(
+            Prompts.Checkpoint(topic.Title, source, topic.DifficultyLevel, CheckpointQuestions),
+            source, CheckpointQuestions, r => r.Questions, ct);
 
-        var questions = ValidQuestions(reply.Questions).Take(CheckpointQuestions).ToList();
         if (questions.Count < 2)
             throw new LlmException("The AI returned an incomplete checkpoint test. Please retry.");
 
@@ -592,8 +726,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
 
         // Copy earlier-topic questions into this test, labelled so the learner knows why they appear.
         Exec(conn, """
-            INSERT INTO learn_questions (quiz_id, topic_id, text, options, correct_index, explanation, option_feedback, label)
-            SELECT $quiz, q.topic_id, q.text, q.options, q.correct_index, q.explanation, q.option_feedback,
+            INSERT INTO learn_questions (quiz_id, topic_id, text, options, correct_index, explanation, option_feedback, source_quote, label)
+            SELECT $quiz, q.topic_id, q.text, q.options, q.correct_index, q.explanation, q.option_feedback, q.source_quote,
                    'Refresher from: ' || t.title
             FROM learn_questions q
             JOIN topics t ON t.id = q.topic_id
@@ -813,10 +947,10 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         }
 
         // The topic's current level picks the teaching style (see Prompts.StyleForLevel).
-        var reply = await AskAsync<LlmLesson>(
-            Prompts.Lesson(topic.Title, source, topic.DifficultyLevel, previousText, missed, isReview), ct);
+        var (reply, questions) = await AskForQuestionsAsync<LlmLesson>(
+            Prompts.Lesson(topic.Title, source, topic.DifficultyLevel, previousText, missed, isReview),
+            source, Prompts.QuizSize, r => r.Questions, ct);
 
-        var questions = ValidQuestions(reply.Questions).Take(Prompts.QuizSize).ToList();
         if (string.IsNullOrWhiteSpace(reply.LessonText) || questions.Count < 2)
             throw new LlmException("The AI returned an incomplete lesson. Please retry.");
 
@@ -832,6 +966,39 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         tx.Commit();
 
         return new LessonRow(lessonId, quizId, reply.LessonText.Trim(), reply.Example);
+    }
+
+    /// <summary>
+    /// Asks the LLM for content that includes quiz questions and keeps only the
+    /// questions that pass two checks made in C#:
+    ///   - well formed (ValidQuestions);
+    ///   - grounded: the question's source_quote is really found in the source
+    ///     text the prompt was given (QuoteFound). The quote is later shown to
+    ///     the learner as "From your notes", so it has to be true.
+    /// If fewer than <paramref name="wanted"/> questions pass, the request is sent
+    /// once more and the better of the two replies is used. The caller decides
+    /// whether what is left is enough.
+    /// </summary>
+    private async Task<(T Reply, List<LlmQuestion> Questions)> AskForQuestionsAsync<T>(
+        string prompt, string source, int wanted, Func<T, List<LlmQuestion>> questionsOf, CancellationToken ct)
+        where T : class
+    {
+        (T Reply, List<LlmQuestion> Questions)? best = null;
+        for (int attempt = 1; attempt <= 2; attempt++)
+        {
+            var reply = await AskAsync<T>(prompt, ct);
+            var wellFormed = ValidQuestions(questionsOf(reply)).ToList();
+            var grounded = wellFormed.Where(q => QuoteFound(source, q.SourceQuote)).ToList();
+
+            if (grounded.Count < wellFormed.Count)
+                log.LogWarning("Attempt {A}: rejected {N} of {Total} questions whose quote is not in the notes",
+                    attempt, wellFormed.Count - grounded.Count, wellFormed.Count);
+
+            if (best is null || grounded.Count > best.Value.Questions.Count)
+                best = (reply, grounded.Take(wanted).ToList());
+            if (grounded.Count >= wanted) break;
+        }
+        return best!.Value;
     }
 
     /// <summary>Drops malformed questions (the LLM's JSON is checked, not trusted).</summary>
@@ -860,12 +1027,12 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     {
         foreach (var q in questions)
             Exec(conn, """
-                INSERT INTO learn_questions (quiz_id, topic_id, text, options, correct_index, explanation, option_feedback, label)
-                VALUES ($q, $t, $text, $opts, $ci, $ex, $fb, $label)
+                INSERT INTO learn_questions (quiz_id, topic_id, text, options, correct_index, explanation, option_feedback, source_quote, label)
+                VALUES ($q, $t, $text, $opts, $ci, $ex, $fb, $quote, $label)
                 """,
                 ("$q", quizId), ("$t", topicId), ("$text", q.Text.Trim()),
                 ("$opts", JsonSerializer.Serialize(q.Options)), ("$ci", q.CorrectIndex), ("$ex", q.Explanation),
-                ("$fb", JsonSerializer.Serialize(q.OptionFeedback)), ("$label", label));
+                ("$fb", JsonSerializer.Serialize(q.OptionFeedback)), ("$quote", q.SourceQuote?.Trim()), ("$label", label));
 
         Exec(conn, "UPDATE learn_quizzes SET total = (SELECT COUNT(*) FROM learn_questions WHERE quiz_id = $q) WHERE id = $q",
             ("$q", quizId));
@@ -985,12 +1152,13 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     }
 
     private sealed record QuestionRow(
-        int Id, int TopicId, int CorrectIndex, int OptionCount, string? Explanation, List<string> OptionFeedback);
+        int Id, int TopicId, int CorrectIndex, int OptionCount, string? Explanation, List<string> OptionFeedback,
+        string? SourceQuote);
 
     private static List<QuestionRow> LoadQuestionRows(SqliteConnection conn, int quizId)
     {
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT id, topic_id, correct_index, options, explanation, option_feedback FROM learn_questions WHERE quiz_id = $q ORDER BY id";
+        cmd.CommandText = "SELECT id, topic_id, correct_index, options, explanation, option_feedback, source_quote FROM learn_questions WHERE quiz_id = $q ORDER BY id";
         cmd.Parameters.AddWithValue("$q", quizId);
         var rows = new List<QuestionRow>();
         using var r = cmd.ExecuteReader();
@@ -998,7 +1166,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             rows.Add(new QuestionRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2),
                 JsonSerializer.Deserialize<List<string>>(r.GetString(3))!.Count,
                 r.IsDBNull(4) ? null : r.GetString(4),
-                r.IsDBNull(5) ? [] : JsonSerializer.Deserialize<List<string>>(r.GetString(5)) ?? []));
+                r.IsDBNull(5) ? [] : JsonSerializer.Deserialize<List<string>>(r.GetString(5)) ?? [],
+                r.IsDBNull(6) ? null : r.GetString(6)));
         return rows;
     }
 
@@ -1146,10 +1315,10 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         foreach (var topic in topics)
         {
             var source = StepsSource(conn, topic, 0, TotalSteps(topic) - 1);
-            var reply = await AskAsync<LlmQuiz>(
-                Prompts.Checkpoint(topic.Title, source, topic.DifficultyLevel, TopicTestQuestions), ct);
+            var (_, questions) = await AskForQuestionsAsync<LlmQuiz>(
+                Prompts.Checkpoint(topic.Title, source, topic.DifficultyLevel, TopicTestQuestions),
+                source, TopicTestQuestions, r => r.Questions, ct);
 
-            var questions = ValidQuestions(reply.Questions).Take(TopicTestQuestions).ToList();
             if (questions.Count < 2)
                 throw new LlmException("The AI returned an incomplete topic test. Please retry.");
             perTopic.Add((topic, questions));
