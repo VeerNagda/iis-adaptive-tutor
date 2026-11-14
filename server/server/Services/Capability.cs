@@ -134,6 +134,22 @@ public static class Capability
     public static string ResetMessage(string topicTitle, int level) =>
         $"The level of \"{topicTitle}\" was set back to {level}.";
 
+    /// <summary>A readable name for each event type, for the History page.</summary>
+    public static string EventLabel(string eventType) => eventType switch
+    {
+        UploadRejected => "Unsupported file refused",
+        ScopeWarning => "Scope warning before ingesting",
+        SourceDowngrade => "Answer label lowered (quote not in notes)",
+        GeneralAnswer => "General-knowledge answer requested",
+        OutOfScopeRequest => "Out-of-scope request",
+        Slip => "Slip corrected",
+        QuestionFlagged => "Question reported",
+        LevelChoice => "Level change accepted or kept",
+        LevelReset => "Level reset",
+        AdaptationPause => "Adaptation paused or resumed",
+        _ => eventType,
+    };
+
     /// <summary>Event types the browser may log itself (a choice the server never sees, such as "Cancel").</summary>
     public static readonly string[] ClientEvents = [ScopeWarning];
 

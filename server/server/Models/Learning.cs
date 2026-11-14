@@ -356,8 +356,28 @@ public class HistoryResponse
     public int Slips { get; set; }
     public int FlaggedQuestions { get; set; }
     public int ChatQuestions { get; set; }
+    // Evidence log (capability_events): how often each kind happened, and the latest ones.
+    public List<EventCount> EventCounts { get; set; } = [];
+    public List<CapabilityEvent> RecentEvents { get; set; } = [];
     public List<SessionHistory> Sessions { get; set; } = [];
     public List<TopicProgress> Topics { get; set; } = [];
+}
+
+public class EventCount
+{
+    public string EventType { get; set; } = "";
+    public string Label { get; set; } = "";
+    public int Count { get; set; }
+}
+
+/// <summary>One row of capability_events: a limit the learner was told about, and what they chose.</summary>
+public class CapabilityEvent
+{
+    public string At { get; set; } = "";
+    public string EventType { get; set; } = "";
+    public string Label { get; set; } = "";
+    public string ShownMessage { get; set; } = "";
+    public string? UserChoice { get; set; }
 }
 
 public class SessionHistory

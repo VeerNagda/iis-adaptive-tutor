@@ -39,6 +39,9 @@ type History = {
   slips: number;
   flaggedQuestions: number;
   chatQuestions: number;
+  // Evidence log: each time the tutor stated a limit, or the learner made a choice about one.
+  eventCounts: { eventType: string; label: string; count: number }[];
+  recentEvents: { at: string; eventType: string; label: string; shownMessage: string; userChoice: string | null }[];
   sessions: SessionHistory[];
   topics: TopicProgress[];
 };
@@ -228,6 +231,39 @@ function HistoryContent() {
                     </li>
                   ))}
                 </ul>
+              )}
+            </section>
+
+            {/* Evidence log: where expectations and capabilities met (for the report's storyboards). */}
+            <section className="rounded-2xl border border-zinc-200 bg-white p-6">
+              <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">Capability events</h2>
+              <p className="mb-4 text-xs text-zinc-500">
+                Each time the tutor told you about a limit, or you made a choice about one.
+              </p>
+              {history.eventCounts.length === 0 ? (
+                <p className="text-sm text-zinc-400">Nothing recorded yet.</p>
+              ) : (
+                <>
+                  <ul className="mb-4 flex flex-wrap gap-2">
+                    {history.eventCounts.map((c) => (
+                      <li key={c.eventType} className="rounded-full bg-zinc-100 px-3 py-1 text-xs text-zinc-700">
+                        {c.label}: <span className="font-semibold">{c.count}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="mb-2 text-xs font-semibold text-zinc-500">Most recent</p>
+                  <ul className="space-y-2 text-xs">
+                    {history.recentEvents.map((e, i) => (
+                      <li key={i} className="rounded-lg border border-zinc-100 px-3 py-2">
+                        <p className="text-zinc-500">
+                          {formatTime(e.at)} · <span className="font-medium text-zinc-700">{e.label}</span>
+                        </p>
+                        <p className="mt-0.5 text-zinc-700">Shown: {e.shownMessage}</p>
+                        {e.userChoice && <p className="mt-0.5 text-zinc-700">Chosen: {e.userChoice}</p>}
+                      </li>
+                    ))}
+                  </ul>
+                </>
               )}
             </section>
 

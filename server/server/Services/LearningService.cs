@@ -1693,6 +1693,9 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
 
     // ══ History ══════════════════════════════════════════════════════════════
 
+    /// <summary>How many of the latest capability events the History page lists.</summary>
+    private const int RecentEventsShown = 20;
+
     /// <summary>
     /// Past sessions plus per-topic progress and difficulty for the History view.
     /// Everything is read from the tables written during learning; no LLM call.
@@ -1714,6 +1717,37 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 JOIN topics t ON t.id = l.topic_id WHERE t.course_id = $c
                 """),
         };
+
+        // ── Evidence log: counts per kind of event, and the most recent events ──
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "SELECT event_type, COUNT(*) FROM capability_events WHERE course_id = $c GROUP BY event_type ORDER BY COUNT(*) DESC";
+            cmd.Parameters.AddWithValue("$c", courseId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                history.EventCounts.Add(new EventCount
+                {
+                    EventType = r.GetString(0), Label = Capability.EventLabel(r.GetString(0)), Count = r.GetInt32(1),
+                });
+        }
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = $"""
+                SELECT timestamp, event_type, shown_message, user_choice FROM capability_events
+                WHERE course_id = $c ORDER BY id DESC LIMIT {RecentEventsShown}
+                """;
+            cmd.Parameters.AddWithValue("$c", courseId);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                history.RecentEvents.Add(new CapabilityEvent
+                {
+                    At = r.GetString(0),
+                    EventType = r.GetString(1),
+                    Label = Capability.EventLabel(r.GetString(1)),
+                    ShownMessage = r.GetString(2),
+                    UserChoice = r.IsDBNull(3) ? null : r.GetString(3),
+                });
+        }
 
         // ── Sessions, newest first, with simple counts ──
         using (var cmd = conn.CreateCommand())
