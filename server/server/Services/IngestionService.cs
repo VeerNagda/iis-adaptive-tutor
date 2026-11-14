@@ -97,40 +97,59 @@ public sealed class IngestionService(
         log.LogInformation("Ingesting document {Id}", documentId);
         SetStatus(documentId, "processing");
 
+        // The report is filled in as each step returns, from that step's actual
+        // result, and is saved whether ingestion finishes or fails. "step" names
+        // the step in progress, so a failure can say exactly where it stopped.
+        var report = new IngestReport { FromPage = fromPage, ToPage = toPage };
+        string step = "reading the file";
+
         try
         {
             var (filePath, fileType, courseId) = GetDocument(documentId);
+            report.Unit = fileType == "pptx" ? "slides" : "pages";
 
             if (!File.Exists(filePath))
                 throw new FileNotFoundException($"File not on disk: {filePath}");
 
             // Step 1 – extract text and images, keeping only the chosen page range
-            var extracted = TextExtractor.Extract(filePath, fileType)
+            var all = TextExtractor.Extract(filePath, fileType);
+            var extracted = all
                 .Where(p => p.PageNumber >= (fromPage ?? 1) && p.PageNumber <= (toPage ?? int.MaxValue))
                 .ToList();
+            report.PagesTotal = all.Count;
+            report.PagesOutsideRange = all.Count - extracted.Count;
+            report.ImagesUnreadable = extracted.Sum(p => p.UnreadableImages);
 
             // Step 1b – the LLM describes the images; the descriptions join the page text
-            var pages = await DescribeImagesAsync(extracted, ct);
+            step = "describing the pictures";
+            var pages = await DescribeImagesAsync(extracted, report, ct);
+            report.PagesRead = pages.Count;
+            report.PagesNoText = extracted.Count - pages.Count;
             if (pages.Count == 0)
                 throw new InvalidOperationException("No text or usable images could be extracted from the file.");
 
             // Step 2 – chunk
+            step = "splitting the text into chunks";
             var chunks = SplitIntoChunks(pages, ChunkTargetWords);
             log.LogInformation("{Count} chunks from {Pages} pages", chunks.Count, pages.Count);
 
             // Step 3 – generate sections
+            step = "grouping the text into sections";
             var sections = await GenerateSectionsAsync(chunks, ct);
 
             // Step 4 – embed
+            step = "indexing the text";
             log.LogInformation("Embedding {Count} chunks…", chunks.Count);
             var embeddings = await embedder.EmbedAsync(
                 chunks.Select(c => c.Text).ToList(), "RETRIEVAL_DOCUMENT", ct);
 
             // Step 5 – store
+            step = "saving";
             DeleteExisting(documentId);
             StoreChunks(documentId, chunks, embeddings);
             StoreSections(documentId, sections);
 
+            SaveReport(documentId, report);
             SetStatus(documentId, "completed");
             log.LogInformation("✓ Document {Id} done: {C} chunks, {S} sections",
                 documentId, chunks.Count, sections.Count);
@@ -138,9 +157,91 @@ public sealed class IngestionService(
         catch (Exception ex)
         {
             log.LogError(ex, "Ingestion failed for document {Id}", documentId);
+            report.Failure = $"It stopped while {step}: {ex.Message}";
+            SaveReport(documentId, report);
             SetStatus(documentId, "failed", ex.Message);
             throw;
         }
+    }
+
+    // ── Ingestion report ───────────────────────────────────────────────────────
+    //
+    // "Done" is only a claim until the numbers behind it are shown. The file card
+    // therefore states what was read and, separately, what was NOT: pages left
+    // out, pictures skipped and why, and the step where a failure happened. The
+    // sentences are built here from the counts; the LLM writes none of them.
+
+    private void SaveReport(int documentId, IngestReport report)
+    {
+        using var conn = db.CreateConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE documents SET ingest_report = @r WHERE id = @id";
+        cmd.Parameters.AddWithValue("@r", JsonSerializer.Serialize(report));
+        cmd.Parameters.AddWithValue("@id", documentId);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Turns the stored counts into the sentences shown on the file card.
+    /// chunks, sections and topics are counted from the database at the time of
+    /// asking, so they are what is really stored, not what a step said it would store.
+    /// </summary>
+    public static DocumentReport Describe(
+        IngestReport r, string status, int chunks, int sections, int topics, bool topicsExtracted)
+    {
+        var text = new DocumentReport();
+        string Plural(int n, string one, string many) => n == 1 ? $"1 {one}" : $"{n} {many}";
+        string unitOne = r.Unit == "slides" ? "slide" : "page";
+        int inRange = r.PagesTotal - r.PagesOutsideRange;
+
+        if (r.Failure is not null)
+        {
+            text.NotDone.Add($"Ingestion did not finish. {r.Failure}");
+            text.NotDone.Add("Nothing from this file is being taught. Press Retry to run it again.");
+            if (r.PagesRead > 0) text.Done.Add($"Before it stopped: read {r.PagesRead} of {inRange} {r.Unit}.");
+            if (r.ImagesDescribed > 0) text.Done.Add($"Before it stopped: {Plural(r.ImagesDescribed, "picture", "pictures")} described.");
+            return text;
+        }
+        if (status != "completed") return text;   // not ingested yet: nothing to report
+
+        // Pages
+        text.Done.Add($"Read {r.PagesRead} of {r.PagesTotal} {r.Unit}.");
+        if (r.PagesOutsideRange > 0)
+            text.NotDone.Add($"{Plural(r.PagesOutsideRange, unitOne, r.Unit)} outside your chosen range "
+                + $"({r.FromPage ?? 1}-{r.ToPage ?? r.PagesTotal}) not read. To add them, remove the file and ingest it again with a wider range.");
+        if (r.PagesNoText > 0)
+            text.NotDone.Add($"{Plural(r.PagesNoText, unitOne, r.Unit)} had no text or usable picture and "
+                + (r.PagesNoText == 1 ? "was" : "were") + " skipped.");
+
+        // Pictures: described, and each reason for a skip with its own count
+        if (r.ImagesFound + r.ImagesUnreadable > 0)
+        {
+            var skipped = new List<string>();
+            if (r.ImagesTooSmall > 0) skipped.Add($"{r.ImagesTooSmall} under {MinImageBytes / 1000} KB");
+            if (r.ImagesDuplicate > 0) skipped.Add($"{Plural(r.ImagesDuplicate, "repeat", "repeats")}");
+            if (r.ImagesDecoration > 0) skipped.Add($"{r.ImagesDecoration} judged to be decoration by the AI");
+            int skippedCount = r.ImagesTooSmall + r.ImagesDuplicate + r.ImagesDecoration;
+            text.Done.Add($"{Plural(r.ImagesDescribed, "picture", "pictures")} described in words"
+                + (skippedCount > 0 ? $", {skippedCount} skipped ({string.Join(", ", skipped)})." : "."));
+
+            if (r.ImagesOverLimit > 0)
+                text.NotDone.Add($"{Plural(r.ImagesOverLimit, "picture was", "pictures were")} not described because of the limit of {MaxImagesPerDocument} per file.");
+            if (r.ImagesTooLarge > 0)
+                text.NotDone.Add($"{Plural(r.ImagesTooLarge, "picture", "pictures")} over {MaxImageBytes / 1_000_000} MB not described.");
+            if (r.ImagesUnreadable > 0)
+                text.NotDone.Add($"{Plural(r.ImagesUnreadable, "picture is", "pictures are")} in a format the tutor can't read.");
+            if (r.ImagesNoReply > 0)
+                text.NotDone.Add($"The AI gave no description for {Plural(r.ImagesNoReply, "picture", "pictures")} it was sent.");
+        }
+
+        // What is stored now
+        text.Done.Add($"Made {Plural(chunks, "chunk", "chunks")} and {Plural(sections, "section", "sections")}.");
+        if (topicsExtracted)
+            text.Done.Add($"{Plural(topics, "topic", "topics")} use this file.");
+        else
+            text.NotDone.Add("Topics have not been made from this file yet. They are added when the topic list loads.");
+
+        return text;
     }
 
     /// <summary>
@@ -210,32 +311,34 @@ public sealed class IngestionService(
     // to keep the number of LLM calls small and predictable.
 
     /// <summary>Smaller files are almost always icons, bullets or lines.</summary>
-    private const int MinImageBytes = 5_000;
+    public const int MinImageBytes = 5_000;
     /// <summary>Larger files are skipped to keep the request within the API's size limit.</summary>
-    private const int MaxImageBytes = 2_000_000;
+    public const int MaxImageBytes = 2_000_000;
     /// <summary>At most this many images are described per document.</summary>
-    private const int MaxImagesPerDocument = 20;
+    public const int MaxImagesPerDocument = 20;
     /// <summary>Images sent in one LLM call (so 20 images cost 4 calls, not 20).</summary>
     private const int ImagesPerCall = 5;
 
     private async Task<List<TextExtractor.PageText>> DescribeImagesAsync(
-        IReadOnlyList<TextExtractor.PageText> pages, CancellationToken ct)
+        IReadOnlyList<TextExtractor.PageText> pages, IngestReport report, CancellationToken ct)
     {
         // Pick the images worth describing, remembering which page each is on.
+        // Every image that is not picked is counted under the rule that left it out.
         var picked = new List<(int PageIndex, LlmImage Image)>();
         var seen = new HashSet<string>();   // an image repeated on every slide (a logo) is sent once
-        int found = 0;
         for (int p = 0; p < pages.Count; p++)
         {
             foreach (var image in pages[p].Images)
             {
-                found++;
-                if (image.Data.Length is < MinImageBytes or > MaxImageBytes) continue;
-                if (!seen.Add(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(image.Data)))) continue;
-                if (picked.Count < MaxImagesPerDocument) picked.Add((p, image));
+                report.ImagesFound++;
+                if (image.Data.Length < MinImageBytes) report.ImagesTooSmall++;
+                else if (image.Data.Length > MaxImageBytes) report.ImagesTooLarge++;
+                else if (!seen.Add(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(image.Data)))) report.ImagesDuplicate++;
+                else if (picked.Count >= MaxImagesPerDocument) report.ImagesOverLimit++;
+                else picked.Add((p, image));
             }
         }
-        log.LogInformation("{Found} images found, {Picked} sent for description", found, picked.Count);
+        log.LogInformation("{Found} images found, {Picked} sent for description", report.ImagesFound, picked.Count);
 
         // One LLM call per batch; each description goes back to its page.
         var described = pages.Select(_ => new StringBuilder()).ToList();
@@ -247,20 +350,23 @@ public sealed class IngestionService(
             List<string> descriptions;
             try
             {
-                descriptions = JsonSerializer.Deserialize<Models.LlmImageDescriptions>(LlmJson.Extract(json))?.Descriptions ?? [];
+                descriptions = JsonSerializer.Deserialize<LlmImageDescriptions>(LlmJson.Extract(json))?.Descriptions ?? [];
             }
             catch (JsonException ex)
             {
                 throw new LlmException("The AI reply for the images was not in the expected format. Please retry.", ex);
             }
 
-            for (int i = 0; i < batch.Length && i < descriptions.Count; i++)
+            for (int i = 0; i < batch.Length; i++)
             {
+                // Counted from what actually came back, not from what was asked for.
+                if (i >= descriptions.Count) { report.ImagesNoReply++; continue; }
                 // An empty description means the LLM judged the image to be decoration.
-                if (string.IsNullOrWhiteSpace(descriptions[i])) continue;
+                if (string.IsNullOrWhiteSpace(descriptions[i])) { report.ImagesDecoration++; continue; }
                 // Kept on one line so the chunker treats it as one paragraph.
                 var oneLine = descriptions[i].ReplaceLineEndings(" ").Trim();
                 described[batch[i].PageIndex].AppendLine($"[Image on this page: {oneLine}]");
+                report.ImagesDescribed++;
             }
         }
 

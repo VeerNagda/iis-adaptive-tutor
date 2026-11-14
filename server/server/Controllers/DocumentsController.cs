@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
 using server.Data;
 using server.Models;
@@ -15,11 +16,18 @@ public class DocumentsController(IDbConnectionFactory db, IConfiguration config,
         using var conn = db.CreateConnection();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, course_id, filename, file_type, file_path,
-                   processing_status, error_message, uploaded_at
-            FROM documents
-            WHERE course_id = $courseId AND deleted_at IS NULL
-            ORDER BY uploaded_at DESC;
+            SELECT d.id, d.course_id, d.filename, d.file_type, d.file_path,
+                   d.processing_status, d.error_message, d.uploaded_at,
+                   d.ingest_report, d.topics_extracted,
+                   -- counted now, so the report shows what is really stored
+                   (SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id),
+                   (SELECT COUNT(*) FROM document_sections s WHERE s.document_id = d.id),
+                   (SELECT COUNT(*) FROM topics t WHERE t.course_id = d.course_id AND EXISTS (
+                        SELECT 1 FROM json_each(t.chunk_ids) j JOIN chunks c ON c.id = j.value
+                        WHERE c.document_id = d.id))
+            FROM documents d
+            WHERE d.course_id = $courseId AND d.deleted_at IS NULL
+            ORDER BY d.uploaded_at DESC;
             """;
         cmd.Parameters.AddWithValue("$courseId", courseId);
 
@@ -27,6 +35,29 @@ public class DocumentsController(IDbConnectionFactory db, IConfiguration config,
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
         {
+            var status = reader.GetString(5);
+            DocumentReport report;
+            if (!reader.IsDBNull(8))
+                report = IngestionService.Describe(
+                    JsonSerializer.Deserialize<IngestReport>(reader.GetString(8))!, status,
+                    chunks: reader.GetInt32(10), sections: reader.GetInt32(11), topics: reader.GetInt32(12),
+                    topicsExtracted: reader.GetInt32(9) == 1);
+            else if (status == "completed")
+                // Ingested before reports existed: say so rather than invent the details.
+                report = new DocumentReport { NotDone = { "Ingested before reports were kept, so the details were not recorded." } };
+            else if (status == "failed")
+                report = new DocumentReport
+                {
+                    NotDone =
+                    {
+                        // Only the first line: older failures stored the AI service's whole raw reply.
+                        $"Ingestion did not finish: {(reader.IsDBNull(6) ? "no reason was recorded" : reader.GetString(6).Split('\n')[0].Trim(' ', '{'))}",
+                        "Nothing from this file is being taught. Press Retry to run it again.",
+                    },
+                };
+            else
+                report = new DocumentReport();
+
             docs.Add(new Document
             {
                 Id = reader.GetInt32(0),
@@ -34,9 +65,10 @@ public class DocumentsController(IDbConnectionFactory db, IConfiguration config,
                 Filename = reader.GetString(2),
                 FileType = reader.GetString(3),
                 FilePath = reader.GetString(4),
-                ProcessingStatus = reader.GetString(5),
+                ProcessingStatus = status,
                 ErrorMessage = reader.IsDBNull(6) ? null : reader.GetString(6),
                 UploadedAt = reader.GetString(7),
+                Report = report,
             });
         }
 
@@ -180,7 +212,8 @@ public class DocumentsController(IDbConnectionFactory db, IConfiguration config,
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            return StatusCode(502, $"The file could not be read: {ex.Message}");
+            // The file cannot even be opened. Carry on to ingestion, which fails for the
+            // same reason and records it on the document, so the file card shows why.
         }
 
         try

@@ -96,6 +96,7 @@ public static class DatabaseInitializer
         AddColumn(connection, "courses", "topic_test_every", "INTEGER NOT NULL DEFAULT 0");
         AddColumn(connection, "topics", "awaiting_test", "INTEGER NOT NULL DEFAULT 0");
         AddColumn(connection, "sessions", "kind", "TEXT NOT NULL DEFAULT 'topic'");
+        AddColumn(connection, "documents", "ingest_report", "TEXT");
 
         // Documents whose topics already exist must not be extracted a second time.
         if (AddColumn(connection, "documents", "topics_extracted", "INTEGER NOT NULL DEFAULT 0"))

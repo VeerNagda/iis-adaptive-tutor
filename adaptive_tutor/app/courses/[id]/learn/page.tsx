@@ -9,7 +9,21 @@ import { apiService } from "../../../services/apiService";
 // ─── Types (match the backend's Models/Learning.cs) ──────────────────────────
 
 type Course = { id: number; title: string; description: string | null };
-type Document = { id: number; filename: string; fileType: string; processingStatus: string };
+type Document = {
+  id: number;
+  filename: string;
+  fileType: string;
+  processingStatus: string;
+  uploadedAt: string;
+  // What ingestion did and did not do, as sentences built by the server from its own counts.
+  report: { done: string[]; notDone: string[] };
+};
+
+// SQLite stores UTC timestamps as "YYYY-MM-DD HH:MM:SS"; show the local date.
+function formatDate(raw: string) {
+  const d = new Date(raw.replace(" ", "T") + "Z");
+  return isNaN(d.getTime()) ? raw : d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
 type Topic = {
   id: number;
   title: string;
@@ -282,7 +296,8 @@ function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested
           {docs.map((doc) => {
             const status = DOC_STATUS[doc.processingStatus] ?? DOC_STATUS.pending;
             return (
-              <li key={doc.id} className="flex items-center gap-3 rounded-xl border border-zinc-200 px-3 py-2">
+              <li key={doc.id} className="rounded-xl border border-zinc-200 px-3 py-2">
+               <div className="flex items-center gap-3">
                 <span className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-xs font-semibold uppercase text-zinc-600">
                   {doc.fileType}
                 </span>
@@ -290,6 +305,7 @@ function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested
                   <p className="truncate text-sm text-zinc-700" title={doc.filename}>{doc.filename}</p>
                   <p className={`text-xs ${status.cls}`}>
                     {ingestingId === doc.id ? "Ingesting… this can take a minute" : status.label}
+                    <span className="text-zinc-400"> · uploaded {formatDate(doc.uploadedAt)}</span>
                   </p>
                 </div>
                 {doc.processingStatus !== "completed" && (
@@ -307,6 +323,18 @@ function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested
                 >
                   Remove
                 </button>
+               </div>
+                {/* Ingestion report: what was read, and separately what was not. */}
+                {ingestingId !== doc.id && (doc.report.done.length > 0 || doc.report.notDone.length > 0) && (
+                  <div className="mt-2 border-t border-zinc-100 pt-2 text-xs leading-relaxed">
+                    {doc.report.done.length > 0 && <p className="text-zinc-600">{doc.report.done.join(" ")}</p>}
+                    {doc.report.notDone.length > 0 && (
+                      <ul className="mt-1 space-y-0.5 text-amber-800">
+                        {doc.report.notDone.map((line) => <li key={line}>Not done: {line}</li>)}
+                      </ul>
+                    )}
+                  </div>
+                )}
               </li>
             );
           })}

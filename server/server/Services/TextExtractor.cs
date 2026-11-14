@@ -15,7 +15,11 @@ namespace server.Services;
 /// </summary>
 public static class TextExtractor
 {
-    public sealed record PageText(int PageNumber, string Text, IReadOnlyList<LlmImage> Images);
+    /// <summary>
+    /// UnreadableImages counts the pictures on the page that could not be handed
+    /// to the LLM (unsupported format or damaged), so the ingestion report can say so.
+    /// </summary>
+    public sealed record PageText(int PageNumber, string Text, IReadOnlyList<LlmImage> Images, int UnreadableImages = 0);
 
     /// <summary>
     /// Every page of the file is returned, including pages with no text, so the
@@ -41,10 +45,12 @@ public static class TextExtractor
     {
         using var doc = PdfDocument.Open(path);
         return doc.GetPages()
-                  .Select(p => new PageText(
-                      p.Number,
-                      string.Join(" ", p.GetWords().Select(w => w.Text)),
-                      includeImages ? PdfImages(p) : []))
+                  .Select(p =>
+                  {
+                      int unreadable = 0;
+                      List<LlmImage> images = includeImages ? PdfImages(p, out unreadable) : [];
+                      return new PageText(p.Number, string.Join(" ", p.GetWords().Select(w => w.Text)), images, unreadable);
+                  })
                   .ToList();
     }
 
@@ -52,11 +58,12 @@ public static class TextExtractor
     /// The images on one PDF page. A PDF stores images in its own internal formats:
     /// PdfPig can convert most of them to PNG; photos are usually stored as a
     /// complete JPEG file (it starts with the bytes FF D8), which is used as it is.
-    /// Anything else is skipped.
+    /// Anything else is skipped and counted in <paramref name="unreadable"/>.
     /// </summary>
-    private static List<LlmImage> PdfImages(UglyToad.PdfPig.Content.Page page)
+    private static List<LlmImage> PdfImages(UglyToad.PdfPig.Content.Page page, out int unreadable)
     {
         var images = new List<LlmImage>();
+        unreadable = 0;
         foreach (var image in page.GetImages())
         {
             try
@@ -65,10 +72,13 @@ public static class TextExtractor
                     images.Add(new LlmImage(png, "image/png"));
                 else if (image.RawBytes.Length > 2 && image.RawBytes[0] == 0xFF && image.RawBytes[1] == 0xD8)
                     images.Add(new LlmImage(image.RawBytes.ToArray(), "image/jpeg"));
+                else
+                    unreadable++;
             }
             catch (Exception)
             {
                 // A damaged or unusual image must not stop the whole document: skip it.
+                unreadable++;
             }
         }
         return images;
@@ -90,14 +100,19 @@ public static class TextExtractor
         int paraCount = 0;
         var current = new System.Text.StringBuilder();
         var images = new List<LlmImage>();
+        int unreadable = 0;
 
         foreach (var para in body.Elements<DocumentFormat.OpenXml.Wordprocessing.Paragraph>())
         {
             // A picture sits inside a paragraph as a "blip" that points (by id) at
             // the image file stored in the document.
             foreach (var blip in includeImages ? para.Descendants<A.Blip>() : [])
+            {
                 if (blip.Embed?.Value is { } id && main!.GetPartById(id) is ImagePart part && IsSupported(part.ContentType))
                     images.Add(ReadImage(part));
+                else
+                    unreadable++;
+            }
 
             var text = para.InnerText.Trim();
             if (string.IsNullOrWhiteSpace(text)) continue;
@@ -108,14 +123,15 @@ public static class TextExtractor
             // Treat every 40 paragraphs as a new virtual page.
             if (paraCount % 40 == 0)
             {
-                pages.Add(new PageText(pageNum++, current.ToString().Trim(), images));
+                pages.Add(new PageText(pageNum++, current.ToString().Trim(), images, unreadable));
                 current.Clear();
                 images = [];
+                unreadable = 0;
             }
         }
 
-        if (current.Length > 0 || images.Count > 0)
-            pages.Add(new PageText(pageNum, current.ToString().Trim(), images));
+        if (current.Length > 0 || images.Count > 0 || unreadable > 0)
+            pages.Add(new PageText(pageNum, current.ToString().Trim(), images, unreadable));
 
         return pages;
     }
@@ -141,7 +157,8 @@ public static class TextExtractor
                 List<LlmImage> images = includeImages
                     ? slide.ImageParts.Where(p => IsSupported(p.ContentType)).Select(ReadImage).ToList()
                     : [];
-                return new PageText(i + 1, text, images);
+                int unreadable = includeImages ? slide.ImageParts.Count(p => !IsSupported(p.ContentType)) : 0;
+                return new PageText(i + 1, text, images, unreadable);
             })
             .ToList();
     }
