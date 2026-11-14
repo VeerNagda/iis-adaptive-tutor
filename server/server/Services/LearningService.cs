@@ -247,8 +247,9 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         try
         {
             using var conn = db.CreateConnection();
-            var session = LoadSession(conn, courseId, sessionId);
-            if (session is null) return null;
+            if (LoadSession(conn, courseId, sessionId) is null) return null;
+            FinishWaitingQuiz(conn, courseId, sessionId);
+            var session = LoadSession(conn, courseId, sessionId)!;
             if (session.Kind == "test") return await GetTopicTestStepAsync(conn, session, ct);
 
             var topic = LoadTopic(conn, session.TopicId);
@@ -272,7 +273,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 step.Type = "done";
                 step.Message = $"You have finished all {totalSteps} lessons of \"{topic.Title}\"."
                     + (topic.Status == "weak"
-                        ? " It is still marked as weak, so it is worth reviewing: it will be taught at an easier level next time."
+                        ? " It is still marked as weak, so it is worth learning again."
                         : "");
                 return step;
             }
@@ -305,7 +306,11 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             if (session.Phase is "lesson" or "review")
             {
                 step.Type = "lesson";
-                step.Lesson = new LessonDto { Id = lesson.Id, Text = lesson.Text, Example = lesson.Example };
+                step.Lesson = new LessonDto
+                {
+                    Id = lesson.Id, Text = lesson.Text, Example = lesson.Example,
+                    Chat = LoadChat(conn, lesson.Id),   // saved, so the chat survives a page refresh
+                };
             }
             else
             {
@@ -382,8 +387,9 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         var passageText = string.Join("\n\n", passages.Select((p, i) =>
             $"[PASSAGE {i + 1} | file: {p.FileName} | {p.PageLabel}]\n{p.Text}"));
 
-        var history = request.History
-            .Where(t => !string.IsNullOrWhiteSpace(t.Answer))
+        // The LLM has no memory between calls, so the last few saved turns are sent along.
+        var history = LoadChat(conn, lesson.Id)
+            .Where(t => t.Source is "notes" or "general")
             .TakeLast(MaxChatTurns)
             .Select(t => (t.Question, t.Answer))
             .ToList();
@@ -391,7 +397,63 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         var reply = await AskAsync<LlmAnswer>(
             Prompts.Ask(topic.Title, passageText, topic.DifficultyLevel, lesson.Text, history, question, request.AllowGeneral), ct);
 
-        return LabelAnswer(conn, session.CourseId, reply, passages, request.AllowGeneral);
+        var answer = LabelAnswer(conn, session.CourseId, reply, passages, request.AllowGeneral);
+        answer.Question = question;
+        SaveChatTurn(conn, lesson.Id, answer, request.AllowGeneral ? request.ReplaceTurnId : null);
+        return answer;
+    }
+
+    // ── Saved chat (lesson_chat): one row per question, kept with its lesson ──
+
+    private static List<AskResponse> LoadChat(SqliteConnection conn, int lessonId)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT id, question, answer, source, source_quote, file_name, page_label, uploaded_at,
+                   from_picture, can_ask_general
+            FROM lesson_chat WHERE lesson_id = $l ORDER BY id
+            """;
+        cmd.Parameters.AddWithValue("$l", lessonId);
+        var turns = new List<AskResponse>();
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            turns.Add(new AskResponse
+            {
+                Id = r.GetInt32(0),
+                Question = r.GetString(1),
+                Answer = r.GetString(2),
+                Source = r.GetString(3),
+                Label = Capability.SourceLabel(r.GetString(3)),
+                SourceQuote = r.IsDBNull(4) ? null : r.GetString(4),
+                FileName = r.IsDBNull(5) ? null : r.GetString(5),
+                PageLabel = r.IsDBNull(6) ? null : r.GetString(6),
+                UploadedAt = r.IsDBNull(7) ? null : r.GetString(7),
+                FromPictureDescription = r.GetInt32(8) == 1,
+                CanAskGeneral = r.GetInt32(9) == 1,
+            });
+        return turns;
+    }
+
+    /// <summary>
+    /// Stores a chat turn and sets its id. replaceId is the earlier "couldn't find
+    /// this" turn when the learner asked for a general-knowledge answer to the
+    /// same question: that row is replaced so the question appears once.
+    /// </summary>
+    private static void SaveChatTurn(SqliteConnection conn, int lessonId, AskResponse turn, int? replaceId)
+    {
+        if (replaceId is not null)
+            Exec(conn, "DELETE FROM lesson_chat WHERE id = $id AND lesson_id = $l AND source = 'none'",
+                ("$id", replaceId), ("$l", lessonId));
+
+        turn.Id = Convert.ToInt32(Scalar(conn, """
+            INSERT INTO lesson_chat (lesson_id, question, answer, source, source_quote, file_name, page_label,
+                                     uploaded_at, from_picture, can_ask_general)
+            VALUES ($l, $q, $a, $source, $quote, $file, $page, $uploaded, $picture, $general) RETURNING id
+            """,
+            ("$l", lessonId), ("$q", turn.Question), ("$a", turn.Answer), ("$source", turn.Source),
+            ("$quote", turn.SourceQuote), ("$file", turn.FileName), ("$page", turn.PageLabel),
+            ("$uploaded", turn.UploadedAt), ("$picture", turn.FromPictureDescription ? 1 : 0),
+            ("$general", turn.CanAskGeneral ? 1 : 0)));
     }
 
     /// <summary>
@@ -537,151 +599,356 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         using var conn = db.CreateConnection();
         var session = LoadSession(conn, courseId, sessionId) ?? throw new LearningException("Session not found.");
         if (session.Phase is not ("lesson" or "quiz")) throw new LearningException("Nothing to skip right now.");
+        // Once the quiz is answered its decision is applied by FinishQuiz, not by skipping.
+        if (Scalar(conn, "SELECT 1 FROM learn_quizzes WHERE session_id = $s AND submitted_at IS NOT NULL AND completed_at IS NULL",
+                ("$s", sessionId)) is not null)
+            throw new LearningException("You have already answered this quiz. Press Next to carry on.");
 
         session.Reason = "You skipped the previous lesson.";
         AdvanceStep(session, LoadTopic(conn, session.TopicId));   // may replace the reason with the checkpoint one
         SaveSession(conn, session);
     }
 
-    /// <summary>
-    /// Scores a submitted quiz and decides what happens next.
-    /// Scoring and the decision are plain C#; no LLM is involved.
-    /// </summary>
+    // ══ Quiz: answer, review, decide ═════════════════════════════════════════
+    //
+    // A quiz is handled in two steps, so the learner keeps control of what the
+    // tutor does with the result:
+    //   1. SubmitAnswers stores the answers. The feedback screen shows a PREVIEW
+    //      of the decision, and on that screen the learner can
+    //        - say one wrong answer was a slip and answer it again (MarkSlip),
+    //        - report a wrong question, which takes it out of the score (FlagQuestion),
+    //        - accept each proposed level change, or keep their level.
+    //   2. FinishQuiz applies the decision: next step, re-teach, level change.
+    // Both steps run the same code (Evaluate). For the preview its database
+    // changes are rolled back; for step 2 they are committed. The preview can
+    // therefore never differ from what happens next.
+
+    /// <summary>"That was a slip" can be used this many times per quiz.</summary>
+    private const int MaxSlipsPerQuiz = 1;
+    /// <summary>The level only goes up when at least this many questions were scored.</summary>
+    private const int MinQuestionsForLevelUp = 2;
+
+    /// <summary>Step 1: store the answers and return a preview of the decision. No LLM is involved.</summary>
     public AnswerResult SubmitAnswers(int courseId, int sessionId, int quizId, SubmitAnswersRequest request)
     {
         using var conn = db.CreateConnection();
+        using (var tx = conn.BeginTransaction())
+        {
+            _ = LoadSession(conn, courseId, sessionId) ?? throw new LearningException("Session not found.");
+            _ = Scalar(conn, """
+                SELECT 1 FROM learn_quizzes
+                WHERE id = $q AND session_id = $s AND submitted_at IS NULL AND completed_at IS NULL
+                """, ("$q", quizId), ("$s", sessionId))
+                ?? throw new LearningException("This quiz was already submitted or does not exist.");
+
+            var questions = LoadQuestionRows(conn, quizId);
+
+            // Demo mode: pick a wrong option for every question (clearly flagged as simulated).
+            var answers = request.SimulateWrong
+                ? questions.Select(q => (q.CorrectIndex + 1) % q.OptionCount).ToList()
+                : request.Answers;
+            if (answers.Count != questions.Count)
+                throw new LearningException("Please answer every question.");
+
+            for (int i = 0; i < questions.Count; i++)
+                Exec(conn, "UPDATE learn_questions SET user_answer = $a, is_correct = $c WHERE id = $id",
+                    ("$a", answers[i]), ("$c", answers[i] == questions[i].CorrectIndex ? 1 : 0), ("$id", questions[i].Id));
+
+            Exec(conn, "UPDATE learn_quizzes SET submitted_at = CURRENT_TIMESTAMP, simulated = $sim WHERE id = $q",
+                ("$sim", request.SimulateWrong ? 1 : 0), ("$q", quizId));
+            tx.Commit();
+        }
+        return Evaluate(conn, courseId, sessionId, quizId, apply: false, keep: [], learnerChose: false);
+    }
+
+    /// <summary>
+    /// "That was a slip": the learner picked the wrong option by accident and
+    /// answers that one question again, without a penalty. A slip is a different
+    /// kind of error from not knowing, so it gets an undo. One per quiz, and each
+    /// use is logged, so the History page shows how often it happens.
+    /// </summary>
+    public AnswerResult MarkSlip(int courseId, int sessionId, int quizId, int questionId, int answer)
+    {
+        using var conn = db.CreateConnection();
+        var questions = ReviewedQuestions(conn, courseId, sessionId, quizId);
+        var question = questions.FirstOrDefault(q => q.Id == questionId)
+            ?? throw new LearningException("That question is not part of this quiz.");
+
+        if (questions.Count(q => q.Slip) >= MaxSlipsPerQuiz)
+            throw new LearningException("You have already used your slip on this quiz.");
+        if (question.Flagged || question.IsCorrect)
+            throw new LearningException("A slip can only be used on a wrong answer.");
+        if (answer < 0 || answer >= question.OptionCount)
+            throw new LearningException("Please pick one of the options.");
+
+        bool correct = answer == question.CorrectIndex;
+        Exec(conn, "UPDATE learn_questions SET user_answer = $a, is_correct = $c, slip = 1 WHERE id = $id",
+            ("$a", answer), ("$c", correct ? 1 : 0), ("$id", questionId));
+        Capability.Log(conn, courseId, Capability.Slip, Capability.SlipMessage,
+            correct ? "Answered again: correct" : "Answered again: still wrong");
+
+        return Evaluate(conn, courseId, sessionId, quizId, apply: false, keep: [], learnerChose: false);
+    }
+
+    /// <summary>
+    /// "Report a wrong question": the learner thinks the question itself is at
+    /// fault (two right options, wrong answer key, not in the notes). The
+    /// question is taken out of the score and is never reused as a refresher.
+    /// </summary>
+    public AnswerResult FlagQuestion(int courseId, int sessionId, int quizId, int questionId)
+    {
+        using var conn = db.CreateConnection();
+        var question = ReviewedQuestions(conn, courseId, sessionId, quizId).FirstOrDefault(q => q.Id == questionId)
+            ?? throw new LearningException("That question is not part of this quiz.");
+
+        if (!question.Flagged)
+        {
+            Exec(conn, "UPDATE learn_questions SET flagged = 1 WHERE id = $id", ("$id", questionId));
+            Capability.Log(conn, courseId, Capability.QuestionFlagged, Capability.FlagMessage, question.Text);
+        }
+        return Evaluate(conn, courseId, sessionId, quizId, apply: false, keep: [], learnerChose: false);
+    }
+
+    /// <summary>Step 2: the learner leaves the feedback screen and the decision takes effect.</summary>
+    public void FinishQuiz(int courseId, int sessionId, int quizId, FinishQuizRequest request)
+    {
+        using var conn = db.CreateConnection();
+        Evaluate(conn, courseId, sessionId, quizId, apply: true, keep: request.KeepLevelTopicIds, learnerChose: true);
+    }
+
+    /// <summary>The questions of a quiz that is on the feedback screen (answered, not yet finished).</summary>
+    private static List<QuestionRow> ReviewedQuestions(SqliteConnection conn, int courseId, int sessionId, int quizId)
+    {
+        _ = LoadSession(conn, courseId, sessionId) ?? throw new LearningException("Session not found.");
+        _ = Scalar(conn, """
+            SELECT 1 FROM learn_quizzes
+            WHERE id = $q AND session_id = $s AND submitted_at IS NOT NULL AND completed_at IS NULL
+            """, ("$q", quizId), ("$s", sessionId))
+            ?? throw new LearningException("This quiz is not waiting for a decision.");
+        return LoadQuestionRows(conn, quizId);
+    }
+
+    /// <summary>
+    /// If the learner left the feedback screen without pressing "Next" (a page
+    /// refresh, for example), the waiting decision is applied as it was previewed,
+    /// with every proposed level change accepted.
+    /// </summary>
+    private void FinishWaitingQuiz(SqliteConnection conn, int courseId, int sessionId)
+    {
+        var waiting = Scalar(conn, """
+            SELECT id FROM learn_quizzes
+            WHERE session_id = $s AND submitted_at IS NOT NULL AND completed_at IS NULL
+            """, ("$s", sessionId));
+        if (waiting is not null)
+            Evaluate(conn, courseId, sessionId, Convert.ToInt32(waiting), apply: true, keep: [], learnerChose: false);
+    }
+
+    /// <summary>What one run of Evaluate needs to know besides the quiz itself.</summary>
+    private sealed class Decision
+    {
+        /// <summary>False for the preview (everything is rolled back), true when the learner moves on.</summary>
+        public bool Apply { get; init; }
+        /// <summary>Topics whose level the learner chose to keep.</summary>
+        public HashSet<int> Keep { get; init; } = [];
+        /// <summary>False when the decision is applied without the learner having chosen (page refresh).</summary>
+        public bool LearnerChose { get; init; }
+        /// <summary>The learner paused adaptation: levels are left alone.</summary>
+        public bool Paused { get; init; }
+        public int CourseId { get; init; }
+        /// <summary>The topic being learned (0 in a topic test), so messages can say "this".</summary>
+        public int SessionTopicId { get; init; }
+        public required AnswerResult Result { get; init; }
+    }
+
+    /// <summary>
+    /// Scores the stored answers and decides what happens next. Scoring and the
+    /// decision are plain C#. Reported (flagged) questions are left out of the score.
+    /// apply = false: preview only, nothing is kept.
+    /// </summary>
+    private AnswerResult Evaluate(
+        SqliteConnection conn, int courseId, int sessionId, int quizId, bool apply, IEnumerable<int> keep, bool learnerChose)
+    {
+        // Disposed without Commit (the preview) = rolled back.
         using var tx = conn.BeginTransaction();
 
         var session = LoadSession(conn, courseId, sessionId) ?? throw new LearningException("Session not found.");
         // A mandatory topic test covers several topics, so it has no single topic.
         var topic = session.Kind == "test" ? null : LoadTopic(conn, session.TopicId);
 
-        var kind = Scalar(conn,
-            "SELECT kind FROM learn_quizzes WHERE id = $q AND session_id = $s AND completed_at IS NULL",
-            ("$q", quizId), ("$s", sessionId)) as string
-            ?? throw new LearningException("This quiz was already submitted or does not exist.");
+        string? kind = null;
+        bool simulated = false;
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT kind, simulated FROM learn_quizzes
+                WHERE id = $q AND session_id = $s AND submitted_at IS NOT NULL AND completed_at IS NULL
+                """;
+            cmd.Parameters.AddWithValue("$q", quizId);
+            cmd.Parameters.AddWithValue("$s", sessionId);
+            using var r = cmd.ExecuteReader();
+            if (r.Read()) (kind, simulated) = (r.GetString(0), r.GetInt32(1) == 1);
+        }
+        if (kind is null) throw new LearningException("This quiz is not waiting for a decision.");
 
         var questions = LoadQuestionRows(conn, quizId);
-
-        // Demo mode: pick a wrong option for every question (clearly flagged as simulated).
-        var answers = request.SimulateWrong
-            ? questions.Select(q => (q.CorrectIndex + 1) % q.OptionCount).ToList()
-            : request.Answers;
-        if (answers.Count != questions.Count)
-            throw new LearningException("Please answer every question.");
+        var scored = questions.Where(q => !q.Flagged).ToList();
 
         // ── Score ──
         var result = new AnswerResult
         {
-            Total = questions.Count,
-            Simulated = request.SimulateWrong,
+            Total = scored.Count,
+            Correct = scored.Count(q => q.IsCorrect),
+            Simulated = simulated,
             OldLevel = topic?.DifficultyLevel ?? 0,
             NewLevel = topic?.DifficultyLevel ?? 0,
-            Evidence = Evidence.BasedOn(questions.Count),
+            Evidence = Evidence.BasedOn(scored.Count),
+            SlipAvailable = questions.Count(q => q.Slip) < MaxSlipsPerQuiz,
         };
-        for (int i = 0; i < questions.Count; i++)
+        foreach (var q in questions)
         {
-            var q = questions[i];
-            bool isCorrect = answers[i] == q.CorrectIndex;
-            if (isCorrect) result.Correct++;
-
-            Exec(conn, "UPDATE learn_questions SET user_answer = $a, is_correct = $c WHERE id = $id",
-                ("$a", answers[i]), ("$c", isCorrect ? 1 : 0), ("$id", q.Id));
-
+            int chosen = q.UserAnswer ?? -1;
             result.Questions.Add(new QuestionFeedback
             {
                 QuestionId = q.Id,
-                UserAnswer = answers[i],
+                UserAnswer = chosen,
                 CorrectIndex = q.CorrectIndex,
-                IsCorrect = isCorrect,
+                IsCorrect = q.IsCorrect,
                 Explanation = q.Explanation,
                 // What went wrong: the stored reason why the option the learner picked is wrong.
-                WhatWentWrong = !isCorrect && answers[i] >= 0 && answers[i] < q.OptionFeedback.Count
-                    ? q.OptionFeedback[answers[i]]
+                WhatWentWrong = !q.IsCorrect && chosen >= 0 && chosen < q.OptionFeedback.Count
+                    ? q.OptionFeedback[chosen]
                     : null,
                 SourceQuote = q.SourceQuote,
+                Slip = q.Slip,
+                Flagged = q.Flagged,
             });
         }
 
         // ── Decide ──
-        if (topic is null) DecideAfterTopicTest(conn, session, quizId, questions, result);
-        else if (kind == "lesson") DecideAfterLessonQuiz(conn, session, topic, quizId, result);
-        else if (kind == "checkpoint") DecideAfterCheckpoint(conn, session, topic, quizId, questions, result);
-        else DecideAfterRetest(conn, session, topic, quizId, result);
+        var decision = new Decision
+        {
+            Apply = apply,
+            Keep = keep.ToHashSet(),
+            LearnerChose = learnerChose,
+            Paused = Convert.ToInt32(Scalar(conn, "SELECT adaptation_paused FROM courses WHERE id = $c", ("$c", courseId))) == 1,
+            CourseId = courseId,
+            SessionTopicId = topic?.Id ?? 0,
+            Result = result,
+        };
+        if (topic is null) DecideAfterTopicTest(conn, decision, session, quizId, questions);
+        else if (kind == "lesson") DecideAfterLessonQuiz(conn, decision, session, topic, quizId);
+        else if (kind == "checkpoint") DecideAfterCheckpoint(conn, decision, session, topic, quizId, scored);
+        else DecideAfterRetest(conn, decision, session, topic, quizId);
+
+        if (!apply) return result;
 
         Exec(conn, """
             UPDATE learn_quizzes
-            SET correct = $c, passed = $p, simulated = $sim, completed_at = CURRENT_TIMESTAMP
+            SET correct = $c, total = $n, passed = $p, completed_at = CURRENT_TIMESTAMP
             WHERE id = $id
             """,
-            ("$c", result.Correct), ("$p", result.Passed ? 1 : 0),
-            ("$sim", request.SimulateWrong ? 1 : 0), ("$id", quizId));
+            ("$c", result.Correct), ("$n", result.Total), ("$p", result.Passed ? 1 : 0), ("$id", quizId));
         SaveSession(conn, session);
         tx.Commit();
         return result;
     }
 
+    private const string NothingScored =
+        "Every question was reported, so this quiz was not scored. Nothing changes and you can carry on.";
+
     /// <summary>
     /// The adaptive branch after a lesson quiz:
-    ///   0 mistakes  → clean pass: praise + insight, next step, difficulty level + 1 (max 5);
+    ///   0 mistakes  → clean pass: praise + insight, next step, propose level + 1 (max 5);
     ///   1 mistake   → pass: praise + insight, next step, level unchanged;
-    ///   2+ mistakes → fail: level - 1 (min 1), teach the same step again in the
-    ///                 easier style, with new questions.
+    ///   2+ mistakes → fail: propose level - 1 (min 1), teach the same step again
+    ///                 in a different way, with new questions.
     /// </summary>
     private void DecideAfterLessonQuiz(
-        SqliteConnection conn, LearnSession session, Topic topic, int quizId, AnswerResult result)
+        SqliteConnection conn, Decision decision, LearnSession session, Topic topic, int quizId)
     {
+        var result = decision.Result;
         int mistakes = result.Total - result.Correct;
         result.Passed = mistakes <= 1;
 
         if (result.Passed)
         {
-            result.Message = mistakes == 0
-                ? "Excellent, every answer was correct!"
-                : "Good work, you passed with just one slip. Here is what went wrong on that question:";
+            result.Message =
+                result.Total == 0 ? NothingScored :
+                mistakes == 0 ? "Excellent, every answer was correct!" :
+                "Good work, you passed with just one mistake. Here is what went wrong on that question:";
             result.Insight = Scalar(conn, """
                 SELECT l.insight FROM learn_lessons l
                 JOIN learn_quizzes q ON q.lesson_id = l.id WHERE q.id = $q
                 """, ("$q", quizId)) as string;
 
-            if (mistakes == 0)
-                ChangeLevel(conn, topic, session.Id, +1, "Passed a lesson quiz with no mistakes", result.Total);
+            if (mistakes == 0 && result.Total >= MinQuestionsForLevelUp)
+                ChangeLevel(conn, decision, topic, session.Id, +1,
+                    "Passed a lesson quiz with no mistakes", result.Total, "you got everything right");
             session.Reason = null;
             AdvanceStep(session, topic);   // may set the reason for a checkpoint test
             result.Decision = session.Phase == "checkpoint" ? "checkpoint" : "advance";
         }
         else
         {
-            ChangeLevel(conn, topic, session.Id, -1, $"Failed a lesson quiz ({result.Correct}/{result.Total})", result.Total);
+            ChangeLevel(conn, decision, topic, session.Id, -1,
+                $"Failed a lesson quiz ({result.Correct}/{result.Total})", result.Total, $"you got {mistakes} wrong");
             session.Attempt++;
             session.Phase = "lesson";
-            session.Reason = $"Re-explained at an easier level ({topic.DifficultyLevel} of 5: "
-                + $"{Prompts.StyleLabel(topic.DifficultyLevel)}) because you missed {mistakes} of {result.Total} questions.";
+            session.Reason = $"Explained again in a different way because you missed {mistakes} of {result.Total} questions.";
             result.Decision = "reteach";
-            result.Message = "Not quite there yet. Let's go through this part again in a simpler way, then try new questions.";
+            result.Message = "Not quite there yet. Let's go through this part again in a different way, then try new questions.";
         }
         result.NewLevel = topic.DifficultyLevel;
     }
 
     /// <summary>
-    /// Raises or lowers a topic's difficulty level, kept within 1..5. The level
-    /// is stored on the topic (so the next session starts from it) and every
-    /// change is written to difficulty_history with its reason and the number of
-    /// questions it was based on (so the History page can show how thin the evidence was).
+    /// Proposes to raise or lower a topic's difficulty level (kept within 1..5).
+    /// The change is the tutor's suggestion, not a fact: it is listed in the result
+    /// with its cause ("because you got 2 wrong"), and the learner can keep their
+    /// level instead. What they chose is written to difficulty_history, together
+    /// with the reason and the number of questions the suggestion was based on.
+    /// While adaptation is paused nothing is proposed at all.
     /// </summary>
-    private static void ChangeLevel(SqliteConnection conn, Topic topic, int sessionId, int delta, string reason, int questions)
+    private static void ChangeLevel(
+        SqliteConnection conn, Decision decision, Topic topic, int sessionId, int delta,
+        string reason, int questions, string because)
     {
         int oldLevel = topic.DifficultyLevel;
         int newLevel = Math.Clamp(oldLevel + delta, 1, 5);
         if (newLevel == oldLevel) return;   // already at the limit
 
-        topic.DifficultyLevel = newLevel;
-        Exec(conn, "UPDATE topics SET difficulty_level = $l WHERE id = $t", ("$l", newLevel), ("$t", topic.Id));
+        if (decision.Paused)
+        {
+            decision.Result.LevelNote = $"Adaptation is paused, so your level stays at {oldLevel}. You can turn it back on from the History page.";
+            return;
+        }
+
+        bool thisTopic = topic.Id == decision.SessionTopicId;
+        string message = $"I'll make {(thisTopic ? "this" : $"\"{topic.Title}\"")} "
+            + $"{(newLevel < oldLevel ? "easier" : "a little harder")} because {because}. Keep level {oldLevel} instead?";
+        decision.Result.LevelProposals.Add(new LevelProposal
+        {
+            TopicId = topic.Id, TopicTitle = topic.Title, OldLevel = oldLevel, NewLevel = newLevel,
+            Message = message, Evidence = Evidence.BasedOn(questions),
+        });
+
+        bool kept = decision.Keep.Contains(topic.Id);
+        if (!kept)
+        {
+            topic.DifficultyLevel = newLevel;
+            Exec(conn, "UPDATE topics SET difficulty_level = $l WHERE id = $t", ("$l", newLevel), ("$t", topic.Id));
+        }
+        // A kept level is recorded too (old level = new level), so the history shows the choice.
         Exec(conn, """
-            INSERT INTO difficulty_history (topic_id, session_id, old_level, new_level, reason, question_count)
-            VALUES ($t, $s, $old, $new, $reason, $n)
+            INSERT INTO difficulty_history (topic_id, session_id, old_level, new_level, reason, question_count, choice)
+            VALUES ($t, $s, $old, $new, $reason, $n, $choice)
             """,
-            ("$t", topic.Id), ("$s", sessionId), ("$old", oldLevel), ("$new", newLevel), ("$reason", reason), ("$n", questions));
+            ("$t", topic.Id), ("$s", sessionId), ("$old", oldLevel), ("$new", kept ? oldLevel : newLevel),
+            ("$reason", reason), ("$n", questions), ("$choice", kept ? "kept" : "accepted"));
+
+        if (decision.Apply)
+            Capability.Log(conn, decision.CourseId, Capability.LevelChoice, message,
+                kept ? "Keep my level" : decision.LearnerChose ? "Accept" : "No choice made (accepted)");
     }
 
     /// <summary>
@@ -749,6 +1016,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             JOIN topics t ON t.id = q.topic_id
             WHERE t.course_id = $course AND q.topic_id <> $topic
               AND q.label IS NULL AND q.user_answer IS NOT NULL
+              AND q.flagged = 0   -- a reported question is never reused
             ORDER BY (t.status = 'weak') DESC, (q.is_correct = 0) DESC, RANDOM()
             LIMIT $n
             """,
@@ -761,33 +1029,35 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
 
     /// <summary>
     /// After a checkpoint: score each topic separately, record it, and mark
-    /// topics below 60% as weak (their level drops by 1).
-    ///   current topic weak → review lesson at the easier level, then a re-test;
-    ///   earlier topic weak → flagged in the topic list; it is re-taught at the
-    ///                        easier level when the learner opens it again.
+    /// topics below 60% as weak (a level drop is proposed for each).
+    ///   current topic weak → review lesson, then a re-test;
+    ///   earlier topic weak → flagged in the topic list; it is re-taught when the
+    ///                        learner opens it again.
+    /// scored = the questions that count (reported questions are left out), so a
+    /// topic whose questions were all reported gets no score and nothing changes for it.
     /// </summary>
     private void DecideAfterCheckpoint(
-        SqliteConnection conn, LearnSession session, Topic topic, int quizId,
-        List<QuestionRow> questions, AnswerResult result)
+        SqliteConnection conn, Decision decision, LearnSession session, Topic topic, int quizId, List<QuestionRow> scored)
     {
+        var result = decision.Result;
         bool currentTopicWeak = false;
-        int currentPct = 0;
+        int? currentPct = null;   // null = no question on the current topic was scored
 
-        // result.Questions is in the same order as questions, so the two can be paired up.
-        var perTopic = questions.Zip(result.Questions).GroupBy(pair => pair.First.TopicId);
-        foreach (var group in perTopic)
+        foreach (var group in scored.GroupBy(q => q.TopicId))
         {
-            var scored = group.Key == topic.Id ? topic : LoadTopic(conn, group.Key);
-            var score = RecordTopicScore(conn, session.Id, quizId, scored,
-                group.Count(pair => pair.Second.IsCorrect), group.Count());
+            var scoredTopic = group.Key == topic.Id ? topic : LoadTopic(conn, group.Key);
+            var score = RecordTopicScore(conn, session.Id, quizId, scoredTopic,
+                group.Count(q => q.IsCorrect), group.Count());
             result.TopicScores.Add(score);
 
             if (score.IsWeak)
             {
-                Exec(conn, "UPDATE topics SET status = 'weak' WHERE id = $t", ("$t", scored.Id));
-                ChangeLevel(conn, scored, session.Id, -1, $"Scored {score.ScorePct}% in a checkpoint test (below {WeakBelowPct}%)", score.Total);
+                Exec(conn, "UPDATE topics SET status = 'weak' WHERE id = $t", ("$t", scoredTopic.Id));
+                ChangeLevel(conn, decision, scoredTopic, session.Id, -1,
+                    $"Scored {score.ScorePct}% in a checkpoint test (below {WeakBelowPct}%)",
+                    score.Total, $"you scored {score.ScorePct}% on it in the test");
             }
-            if (scored.Id == topic.Id)
+            if (scoredTopic.Id == topic.Id)
             {
                 currentTopicWeak = score.IsWeak;
                 currentPct = score.ScorePct;
@@ -802,25 +1072,36 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             topic.Status = "weak";
             session.Phase = "review";
             session.ReviewRound = 1;
-            session.Reason = ReviewReason(topic, currentPct);
+            session.Reason = ReviewReason(currentPct ?? 0);
             result.Decision = "review";
             result.Message = $"You scored {currentPct}% on this topic, which is below {WeakBelowPct}%. "
-                + "Let's review it in an easier way and then re-test.";
+                + "Let's review it in a different way and then re-test.";
         }
         else
         {
             // Passing a checkpoint on a topic that was weak clears the flag.
-            ClearWeak(conn, topic);
+            if (currentPct is not null) ClearWeak(conn, topic);
             FinishCheckpoint(session, topic);
             result.Decision = session.Phase == "done" ? "done" : "advance";
-            result.Message = $"Checkpoint passed with {currentPct}% on this topic.";
+            result.Message = currentPct is null ? NothingScored : $"Checkpoint passed with {currentPct}% on this topic.";
         }
     }
 
     /// <summary>After the re-test that follows a review lesson.</summary>
     private void DecideAfterRetest(
-        SqliteConnection conn, LearnSession session, Topic topic, int quizId, AnswerResult result)
+        SqliteConnection conn, Decision decision, LearnSession session, Topic topic, int quizId)
     {
+        var result = decision.Result;
+        if (result.Total == 0)
+        {
+            // Every question was reported: there is no score to act on, so move on unchanged.
+            result.Passed = true;
+            FinishCheckpoint(session, topic);
+            result.Decision = session.Phase == "done" ? "done" : "advance";
+            result.Message = NothingScored;
+            return;
+        }
+
         var score = RecordTopicScore(conn, session.Id, quizId, topic, result.Correct, result.Total);
         result.TopicScores.Add(score);
         result.Passed = !score.IsWeak;
@@ -834,7 +1115,9 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         }
         else
         {
-            ChangeLevel(conn, topic, session.Id, -1, $"Scored {score.ScorePct}% in a re-test (below {WeakBelowPct}%)", score.Total);
+            ChangeLevel(conn, decision, topic, session.Id, -1,
+                $"Scored {score.ScorePct}% in a re-test (below {WeakBelowPct}%)",
+                score.Total, $"you scored {score.ScorePct}% in the re-test");
 
             if (session.ReviewRound >= MaxReviewRounds)
             {
@@ -848,17 +1131,16 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             {
                 session.ReviewRound++;
                 session.Phase = "review";
-                session.Reason = ReviewReason(topic, score.ScorePct);
+                session.Reason = ReviewReason(score.ScorePct);
                 result.Decision = "review";
-                result.Message = $"You scored {score.ScorePct}%, still below {WeakBelowPct}%. One more review, even simpler this time.";
+                result.Message = $"You scored {score.ScorePct}%, still below {WeakBelowPct}%. One more review, in another way.";
             }
         }
         result.NewLevel = topic.DifficultyLevel;
     }
 
-    private static string ReviewReason(Topic topic, int pct) =>
-        $"Review at an easier level ({topic.DifficultyLevel} of 5: {Prompts.StyleLabel(topic.DifficultyLevel)}) "
-        + $"because you scored {pct}% on this topic in the test (below {WeakBelowPct}%).";
+    private static string ReviewReason(int pct) =>
+        $"Review lesson because you scored {pct}% on this topic in the test (below {WeakBelowPct}%).";
 
     /// <summary>Stores one topic's checkpoint score. Weak = below 60%.</summary>
     private static TopicScore RecordTopicScore(
@@ -1168,22 +1450,30 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     }
 
     private sealed record QuestionRow(
-        int Id, int TopicId, int CorrectIndex, int OptionCount, string? Explanation, List<string> OptionFeedback,
-        string? SourceQuote);
+        int Id, int TopicId, string Text, int CorrectIndex, int OptionCount, string? Explanation,
+        List<string> OptionFeedback, string? SourceQuote,
+        int? UserAnswer, bool IsCorrect, bool Slip, bool Flagged);
 
     private static List<QuestionRow> LoadQuestionRows(SqliteConnection conn, int quizId)
     {
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT id, topic_id, correct_index, options, explanation, option_feedback, source_quote FROM learn_questions WHERE quiz_id = $q ORDER BY id";
+        cmd.CommandText = """
+            SELECT id, topic_id, text, correct_index, options, explanation, option_feedback, source_quote,
+                   user_answer, is_correct, slip, flagged
+            FROM learn_questions WHERE quiz_id = $q ORDER BY id
+            """;
         cmd.Parameters.AddWithValue("$q", quizId);
         var rows = new List<QuestionRow>();
         using var r = cmd.ExecuteReader();
         while (r.Read())
-            rows.Add(new QuestionRow(r.GetInt32(0), r.GetInt32(1), r.GetInt32(2),
-                JsonSerializer.Deserialize<List<string>>(r.GetString(3))!.Count,
-                r.IsDBNull(4) ? null : r.GetString(4),
-                r.IsDBNull(5) ? [] : JsonSerializer.Deserialize<List<string>>(r.GetString(5)) ?? [],
-                r.IsDBNull(6) ? null : r.GetString(6)));
+            rows.Add(new QuestionRow(r.GetInt32(0), r.GetInt32(1), r.GetString(2), r.GetInt32(3),
+                JsonSerializer.Deserialize<List<string>>(r.GetString(4))!.Count,
+                r.IsDBNull(5) ? null : r.GetString(5),
+                r.IsDBNull(6) ? [] : JsonSerializer.Deserialize<List<string>>(r.GetString(6)) ?? [],
+                r.IsDBNull(7) ? null : r.GetString(7),
+                r.IsDBNull(8) ? null : r.GetInt32(8),
+                !r.IsDBNull(9) && r.GetInt32(9) == 1,
+                r.GetInt32(10) == 1, r.GetInt32(11) == 1));
         return rows;
     }
 
@@ -1352,30 +1642,38 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
 
     /// <summary>
     /// After the topic test: score each topic, mark the ones below 60% to be
-    /// re-taught, and unlock the topic list again.
+    /// re-taught, and unlock the topic list again. Reported questions are left
+    /// out; a topic with no scored question left is simply confirmed as completed.
     /// </summary>
     private void DecideAfterTopicTest(
-        SqliteConnection conn, LearnSession session, int quizId, List<QuestionRow> questions, AnswerResult result)
+        SqliteConnection conn, Decision decision, LearnSession session, int quizId, List<QuestionRow> questions)
     {
+        var result = decision.Result;
         var reteach = new List<string>();
 
-        // result.Questions is in the same order as questions, so the two can be paired up.
-        foreach (var group in questions.Zip(result.Questions).GroupBy(pair => pair.First.TopicId))
+        foreach (var group in questions.GroupBy(q => q.TopicId))
         {
             var topic = LoadTopic(conn, group.Key);
-            var score = RecordTopicScore(conn, session.Id, quizId, topic,
-                group.Count(pair => pair.Second.IsCorrect), group.Count());
-            result.TopicScores.Add(score);
+            var scored = group.Where(q => !q.Flagged).ToList();
+            bool weak = false;
 
-            if (score.IsWeak)
+            if (scored.Count > 0)
             {
-                reteach.Add(topic.Title);
-                ChangeLevel(conn, topic, session.Id, -1,
-                    $"Scored {score.ScorePct}% in a mandatory topic test (below {WeakBelowPct}%)", score.Total);
+                var score = RecordTopicScore(conn, session.Id, quizId, topic, scored.Count(q => q.IsCorrect), scored.Count);
+                result.TopicScores.Add(score);
+                weak = score.IsWeak;
+
+                if (weak)
+                {
+                    reteach.Add(topic.Title);
+                    ChangeLevel(conn, decision, topic, session.Id, -1,
+                        $"Scored {score.ScorePct}% in a mandatory topic test (below {WeakBelowPct}%)",
+                        score.Total, $"you scored {score.ScorePct}% on it in the test");
+                }
             }
             // Below 60%: to be re-taught. Otherwise the topic is confirmed as completed.
             Exec(conn, "UPDATE topics SET status = $status, awaiting_test = 0 WHERE id = $t",
-                ("$status", score.IsWeak ? "weak" : "completed"), ("$t", topic.Id));
+                ("$status", weak ? "weak" : "completed"), ("$t", topic.Id));
         }
 
         // Pick the gap to the next topic test: 2 or 3 completed topics.
@@ -1386,7 +1684,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         result.Decision = "done";
         result.Message = result.Passed
             ? "Well done, you passed every topic in this test."
-            : "These topics are marked to be re-taught at an easier level: " + string.Join(", ", reteach) + ".";
+            : "These topics are marked to be re-taught: " + string.Join(", ", reteach) + ".";
 
         session.Phase = "done";
         session.Status = "completed";
@@ -1402,7 +1700,20 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     public HistoryResponse GetHistory(int courseId)
     {
         using var conn = db.CreateConnection();
-        var history = new HistoryResponse();
+
+        // "What the tutor has stored about you": besides the topic levels and
+        // statuses below, these counts are everything the tutor keeps on the learner.
+        int Count(string sql) => Convert.ToInt32(Scalar(conn, sql, ("$c", courseId)));
+        var history = new HistoryResponse
+        {
+            AdaptationPaused = Count("SELECT adaptation_paused FROM courses WHERE id = $c") == 1,
+            Slips = Count("SELECT COUNT(*) FROM learn_questions q JOIN topics t ON t.id = q.topic_id WHERE t.course_id = $c AND q.slip = 1"),
+            FlaggedQuestions = Count("SELECT COUNT(*) FROM learn_questions q JOIN topics t ON t.id = q.topic_id WHERE t.course_id = $c AND q.flagged = 1"),
+            ChatQuestions = Count("""
+                SELECT COUNT(*) FROM lesson_chat ch JOIN learn_lessons l ON l.id = ch.lesson_id
+                JOIN topics t ON t.id = l.topic_id WHERE t.course_id = $c
+                """),
+        };
 
         // ── Sessions, newest first, with simple counts ──
         using (var cmd = conn.CreateCommand())
@@ -1460,7 +1771,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
 
             using var cmd = conn.CreateCommand();
             cmd.CommandText = """
-                SELECT old_level, new_level, reason, created_at, question_count
+                SELECT old_level, new_level, reason, created_at, question_count, choice
                 FROM difficulty_history WHERE topic_id = $t ORDER BY id
                 """;
             cmd.Parameters.AddWithValue("$t", topic.Id);
@@ -1473,12 +1784,47 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                     Reason = r.GetString(2),
                     At = r.GetString(3),
                     Evidence = r.IsDBNull(4) ? null : Evidence.BasedOn(r.GetInt32(4)),
+                    Choice = r.IsDBNull(5) ? null : r.GetString(5),
                 });
 
             history.Topics.Add(progress);
         }
 
         return history;
+    }
+
+    // ══ The learner's own controls over what is stored ═══════════════════════
+
+    /// <summary>Every topic starts at this level, and "Reset level" returns to it.</summary>
+    private const int StartLevel = 3;
+
+    /// <summary>"Reset level": puts a topic back to the starting level. Recorded like any other change.</summary>
+    public void ResetLevel(int courseId, int topicId)
+    {
+        using var conn = db.CreateConnection();
+        var topic = LoadTopics(conn, courseId).FirstOrDefault(t => t.Id == topicId)
+            ?? throw new LearningException("Topic not found.");
+        if (topic.DifficultyLevel == StartLevel) return;
+
+        Exec(conn, "UPDATE topics SET difficulty_level = $l WHERE id = $t", ("$l", StartLevel), ("$t", topicId));
+        Exec(conn, """
+            INSERT INTO difficulty_history (topic_id, old_level, new_level, reason, choice)
+            VALUES ($t, $old, $new, 'Reset by you', 'reset')
+            """, ("$t", topicId), ("$old", topic.DifficultyLevel), ("$new", StartLevel));
+        Capability.Log(conn, courseId, Capability.LevelReset,
+            Capability.ResetMessage(topic.Title, StartLevel), $"Reset level (was {topic.DifficultyLevel})");
+    }
+
+    /// <summary>
+    /// "Pause adaptation": while paused, no level change is proposed or made
+    /// (see ChangeLevel). Lessons, quizzes, re-teaching and tests carry on.
+    /// </summary>
+    public void SetAdaptationPaused(int courseId, bool paused)
+    {
+        using var conn = db.CreateConnection();
+        Exec(conn, "UPDATE courses SET adaptation_paused = $p WHERE id = $c", ("$p", paused ? 1 : 0), ("$c", courseId));
+        Capability.Log(conn, courseId, Capability.AdaptationPause,
+            paused ? Capability.PausedMessage : Capability.ResumedMessage, paused ? "Pause adaptation" : "Resume adaptation");
     }
 
     // ══ Helpers ══════════════════════════════════════════════════════════════

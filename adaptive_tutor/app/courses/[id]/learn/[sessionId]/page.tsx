@@ -22,7 +22,7 @@ type Step = {
   completedSteps: number; // lessons finished so far
   totalSteps: number;
   reason: string | null; // why this content is shown
-  lesson: { id: number; text: string; example: string | null } | null;
+  lesson: { id: number; text: string; example: string | null; chat: ChatTurn[] } | null; // chat = saved questions and answers
   quiz: Quiz | null;
   message: string | null;
 };
@@ -38,6 +38,10 @@ type AnswerResult = {
   oldLevel: number;
   newLevel: number;
   evidence: string; // "Based on N questions"
+  // Level changes the tutor suggests. Nothing changes until the learner has chosen and pressed Next.
+  levelProposals: { topicId: number; topicTitle: string; oldLevel: number; newLevel: number; message: string; evidence: string }[];
+  levelNote: string | null; // set while adaptation is paused
+  slipAvailable: boolean; // "That was a slip" can be used once per quiz
   questions: {
     questionId: number;
     userAnswer: number;
@@ -46,6 +50,8 @@ type AnswerResult = {
     explanation: string | null; // why the correct option is right
     whatWentWrong: string | null; // why the option the learner picked is wrong
     sourceQuote: string | null; // the words of the notes the question is based on
+    slip: boolean; // answered again after "That was a slip"
+    flagged: boolean; // reported as a wrong question: not counted
   }[];
   topicScores: { topicId: number; topicTitle: string; correct: number; total: number; scorePct: number; isWeak: boolean; evidence: string }[];
 };
@@ -66,7 +72,7 @@ const QUIZ_TITLE: Record<Quiz["kind"], string> = {
 
 const NEXT_LABEL: Record<AnswerResult["decision"], string> = {
   advance: "Next lesson",
-  reteach: "See the simpler explanation",
+  reteach: "See the new explanation",
   checkpoint: "Start the checkpoint test",
   review: "Start the review",
   done: "Finish",
@@ -100,13 +106,15 @@ function ReasonLabel({ text }: { text: string }) {
 }
 
 // User control: the learner can clear up a doubt before moving on to the quiz.
-// The chat lives only in this component: the server answers each question from
+// The chat is saved with the lesson on the server, which answers each question from
 // the lesson and the uploaded material, and is sent the earlier turns so that
 // follow-up questions make sense. Asking never changes the difficulty level.
 //
 // Every answer carries a label saying where it comes from. The server decides
 // the label: "notes" only when it found the quote in the uploaded material.
 type ChatAnswer = {
+  id: number; // id of the saved turn
+  question: string;
   answer: string;
   // out_of_scope: something the tutor cannot do; the answer is then a fixed text from the server.
   source: "notes" | "general" | "none" | "out_of_scope";
@@ -118,7 +126,7 @@ type ChatAnswer = {
   fromPictureDescription: boolean;
   canAskGeneral: boolean;
 };
-type ChatTurn = ChatAnswer & { question: string };
+type ChatTurn = ChatAnswer;
 
 const SOURCE_STYLE: Record<ChatAnswer["source"], string> = {
   notes: "bg-green-100 text-green-800",
@@ -133,8 +141,9 @@ function formatDate(raw: string) {
   return isNaN(d.getTime()) ? raw : d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 }
 
-function LessonChat({ askUrl, disabled }: { askUrl: string; disabled: boolean }) {
-  const [turns, setTurns] = useState<ChatTurn[]>([]);
+// saved = the turns stored on the server for this lesson, so the chat is still there after a refresh.
+function LessonChat({ askUrl, disabled, saved }: { askUrl: string; disabled: boolean; saved: ChatTurn[] }) {
+  const [turns, setTurns] = useState<ChatTurn[]>(saved);
   const [draft, setDraft] = useState("");
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -147,9 +156,9 @@ function LessonChat({ askUrl, disabled }: { askUrl: string; disabled: boolean })
     setAsking(true);
     setError(null);
     try {
-      const history = turns.map((t) => ({ question: t.question, answer: t.answer }));
-      const reply = await apiService.post<ChatAnswer>(askUrl, { question, history, allowGeneral });
-      const turn = { question, ...reply };
+      // The server keeps the chat, so only the new question is sent.
+      const replaceTurnId = replaceIndex === undefined ? null : turns[replaceIndex].id;
+      const turn = await apiService.post<ChatAnswer>(askUrl, { question, allowGeneral, replaceTurnId });
       setTurns((prev) => (replaceIndex === undefined ? [...prev, turn] : prev.map((t, i) => (i === replaceIndex ? turn : t))));
       if (replaceIndex === undefined) setDraft("");
     } catch (err) {
@@ -259,7 +268,7 @@ function LessonView({
         </div>
       )}
       {/* key: a new lesson (next step or a re-explanation) starts an empty chat. */}
-      <LessonChat key={lesson.id} askUrl={askUrl} disabled={busy} />
+      <LessonChat key={lesson.id} askUrl={askUrl} disabled={busy} saved={lesson.chat} />
       <div className="mt-6 flex flex-wrap gap-2">
         <button
           onClick={() => onAction("continue")}
@@ -377,12 +386,33 @@ function QuizView({
   );
 }
 
-function FeedbackView({ step, result, busy, onNext }: { step: Step; result: AnswerResult; busy: boolean; onNext: () => void }) {
+// The feedback screen shows a PREVIEW: nothing has taken effect yet. Here the
+// learner can undo a slip, report a wrong question, and accept or refuse each
+// level change. The decision is applied when they press the Next button.
+function FeedbackView({
+  step, result, busy, onSlip, onFlag, onFinish,
+}: {
+  step: Step;
+  result: AnswerResult;
+  busy: boolean;
+  onSlip: (questionId: number, answer: number) => void;
+  onFlag: (questionId: number) => void;
+  onFinish: (keepLevelTopicIds: number[]) => void;
+}) {
   const quiz = step.quiz!;
+  // The learner's answer to each level proposal, by topic id. Next stays locked until all are answered.
+  const [levelChoice, setLevelChoice] = useState<Record<number, "accept" | "keep">>({});
+  // The question being answered again as a slip, and the option picked for it.
+  const [slipFor, setSlipFor] = useState<number | null>(null);
+  const [slipAnswer, setSlipAnswer] = useState<number | null>(null);
+
+  const allChosen = result.levelProposals.every((p) => levelChoice[p.topicId] !== undefined);
   // Passed with exactly one mistake: that mistake is explained right in the summary box.
-  const wrong = result.questions.filter((f) => !f.isCorrect);
+  const wrong = result.questions.filter((f) => !f.isCorrect && !f.flagged);
   const singleMistake = result.passed && wrong.length === 1 ? wrong[0] : null;
   const singleMistakeQuestion = singleMistake ? quiz.questions.find((q) => q.id === singleMistake.questionId) : null;
+  const smallButton = "rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50";
+
   return (
     <div>
       <div className={`mb-4 rounded-xl border px-4 py-3 ${result.passed ? "border-green-200 bg-green-50" : "border-amber-200 bg-amber-50"}`}>
@@ -413,14 +443,34 @@ function FeedbackView({ step, result, busy, onNext }: { step: Step; result: Answ
             <span className="font-semibold">Insight: </span>{result.insight}
           </p>
         )}
-        {result.newLevel !== result.oldLevel && (
-          <p className="mt-2 text-xs text-zinc-600">
-            Difficulty level changed from {result.oldLevel} to {result.newLevel} (
-            {result.newLevel > result.oldLevel ? "harder, because you answered everything correctly" : "easier, to help you get there"}).{" "}
-            {result.evidence}.
-          </p>
-        )}
+        {result.levelNote && <p className="mt-2 text-xs text-zinc-600">{result.levelNote}</p>}
       </div>
+
+      {/* Level changes are proposals: the cause is stated and the learner decides. */}
+      {result.levelProposals.map((p) => (
+        <div key={p.topicId} className="mb-4 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3">
+          <p className="text-sm text-blue-900">{p.message}</p>
+          <p className="mt-0.5 text-xs text-blue-800">
+            Level {p.oldLevel} → {p.newLevel} · {p.evidence}
+          </p>
+          <div className="mt-2 flex gap-2" role="group" aria-label={`Level change for ${p.topicTitle}`}>
+            {(["accept", "keep"] as const).map((choice) => (
+              <button
+                key={choice}
+                onClick={() => setLevelChoice((prev) => ({ ...prev, [p.topicId]: choice }))}
+                aria-pressed={levelChoice[p.topicId] === choice}
+                className={`rounded-lg border px-3 py-1.5 text-xs font-medium ${
+                  levelChoice[p.topicId] === choice
+                    ? "border-blue-700 bg-blue-700 text-white"
+                    : "border-blue-300 bg-white text-blue-900 hover:bg-blue-100"
+                }`}
+              >
+                {choice === "accept" ? `Accept (level ${p.newLevel})` : `Keep my level (${p.oldLevel})`}
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
 
       {/* Checkpoints: score per topic */}
       {result.topicScores.length > 0 && (
@@ -445,13 +495,19 @@ function FeedbackView({ step, result, busy, onNext }: { step: Step; result: Answ
         {quiz.questions.map((q, qi) => {
           const fb = result.questions.find((f) => f.questionId === q.id);
           if (!fb) return null;
+          const border = fb.flagged ? "border-zinc-300 bg-zinc-50" : fb.isCorrect ? "border-green-200" : "border-red-200";
           return (
-            <li key={q.id} className={`rounded-xl border p-4 text-sm ${fb.isCorrect ? "border-green-200" : "border-red-200"}`}>
+            <li key={q.id} className={`rounded-xl border p-4 text-sm ${border}`}>
               <p className="mb-2 font-medium text-zinc-900">
                 {qi + 1}. {q.text}{" "}
-                <span className={fb.isCorrect ? "text-green-700" : "text-red-600"}>
-                  {fb.isCorrect ? "✓ Correct" : "✗ Not quite"}
-                </span>
+                {fb.flagged ? (
+                  <span className="text-zinc-500">Reported · not counted</span>
+                ) : (
+                  <span className={fb.isCorrect ? "text-green-700" : "text-red-600"}>
+                    {fb.isCorrect ? "✓ Correct" : "✗ Not quite"}
+                  </span>
+                )}
+                {fb.slip && <span className="ml-2 text-xs font-normal text-zinc-500">(answered again as a slip)</span>}
               </p>
               <p className="text-zinc-700">Your answer: {q.options[fb.userAnswer] ?? "none"}</p>
               {!fb.isCorrect && fb.whatWentWrong && (
@@ -465,18 +521,70 @@ function FeedbackView({ step, result, busy, onNext }: { step: Step; result: Answ
                   <span className="font-semibold">From your notes: </span>“{fb.sourceQuote}”
                 </p>
               )}
+
+              {/* Answering again after a slip: pick the option that was meant. */}
+              {slipFor === q.id && (
+                <div className="mt-3 rounded-lg border border-zinc-200 bg-white p-3">
+                  <p className="mb-2 text-xs text-zinc-600">Pick the answer you meant. This does not count against you.</p>
+                  <div className="space-y-1">
+                    {q.options.map((opt, oi) => (
+                      <label key={oi} className="flex cursor-pointer items-center gap-2 text-sm text-zinc-800">
+                        <input type="radio" name={`slip${q.id}`} checked={slipAnswer === oi} onChange={() => setSlipAnswer(oi)} className="accent-zinc-900" />
+                        {opt}
+                      </label>
+                    ))}
+                  </div>
+                  <div className="mt-2 flex gap-2">
+                    <button
+                      onClick={() => { onSlip(q.id, slipAnswer!); setSlipFor(null); setSlipAnswer(null); }}
+                      disabled={busy || slipAnswer === null}
+                      className={smallButton}
+                    >
+                      Save this answer
+                    </button>
+                    <button onClick={() => { setSlipFor(null); setSlipAnswer(null); }} className={smallButton}>Cancel</button>
+                  </div>
+                </div>
+              )}
+
+              {/* Error recovery: a slip gets an undo, a faulty question can be reported. */}
+              {!fb.flagged && slipFor !== q.id && (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {!fb.isCorrect && result.slipAvailable && (
+                    <button
+                      onClick={() => { setSlipFor(q.id); setSlipAnswer(null); }}
+                      disabled={busy}
+                      className={smallButton}
+                      title="You knew it but picked the wrong option by accident. Once per quiz."
+                    >
+                      That was a slip
+                    </button>
+                  )}
+                  <button
+                    onClick={() => onFlag(q.id)}
+                    disabled={busy}
+                    className={smallButton}
+                    title="The question itself is wrong or unclear. It will not count and will not be used again."
+                  >
+                    Report a wrong question
+                  </button>
+                </div>
+              )}
             </li>
           );
         })}
       </ol>
 
-      <button
-        onClick={onNext}
-        disabled={busy}
-        className="mt-6 rounded-lg bg-zinc-900 px-5 py-2.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50"
-      >
-        {NEXT_LABEL[result.decision] ?? "Continue"}
-      </button>
+      <div className="mt-6 flex flex-wrap items-center gap-3">
+        <button
+          onClick={() => onFinish(result.levelProposals.filter((p) => levelChoice[p.topicId] === "keep").map((p) => p.topicId))}
+          disabled={busy || !allChosen}
+          className="rounded-lg bg-zinc-900 px-5 py-2.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50"
+        >
+          {NEXT_LABEL[result.decision] ?? "Continue"}
+        </button>
+        {!allChosen && <span className="text-xs text-zinc-500">Choose Accept or Keep my level above first.</span>}
+      </div>
     </div>
   );
 }
@@ -541,12 +649,37 @@ function SessionContent() {
     setBusy(true);
     try {
       const result = await apiService.post<AnswerResult>(`${base}/quizzes/${step.quiz!.id}/answers`, { answers, simulateWrong });
-      // The header keeps showing the level of the quiz just taken; the feedback
-      // box states any level change, and the next step loads the new level.
+      // This result is a preview: nothing takes effect until "Next" (finish below).
       setView({ kind: "feedback", step, result });
     } catch (e) {
       setView({ kind: "error", text: e instanceof Error ? e.message : "Something went wrong." });
     } finally {
+      setBusy(false);
+    }
+  }
+
+  // On the feedback screen: "That was a slip" and "Report a wrong question".
+  // Both return the re-worked preview, which replaces the one on screen.
+  async function review(step: Step, path: string, body: unknown) {
+    setBusy(true);
+    try {
+      const result = await apiService.post<AnswerResult>(`${base}/quizzes/${step.quiz!.id}/${path}`, body);
+      setView({ kind: "feedback", step, result });
+    } catch (e) {
+      setView({ kind: "error", text: e instanceof Error ? e.message : "Something went wrong." });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // "Next": the decision takes effect, except the level changes the learner chose to keep.
+  async function finish(step: Step, keepLevelTopicIds: number[]) {
+    setBusy(true);
+    try {
+      await apiService.post(`${base}/quizzes/${step.quiz!.id}/finish`, { keepLevelTopicIds });
+      reload("Loading…");
+    } catch (e) {
+      setView({ kind: "error", text: e instanceof Error ? e.message : "Something went wrong." });
       setBusy(false);
     }
   }
@@ -602,7 +735,15 @@ function SessionContent() {
           )}
 
           {view.kind === "feedback" && (
-            <FeedbackView step={view.step} result={view.result} busy={busy} onNext={() => reload("Loading…")} />
+            <FeedbackView
+              key={view.step.quiz!.id}
+              step={view.step}
+              result={view.result}
+              busy={busy}
+              onSlip={(questionId, answer) => review(view.step, `questions/${questionId}/slip`, { answer })}
+              onFlag={(questionId) => review(view.step, `questions/${questionId}/flag`, {})}
+              onFinish={(keep) => finish(view.step, keep)}
+            />
           )}
 
           {view.kind === "step" && view.step.type === "done" && (

@@ -69,6 +69,35 @@ public class LearningController(LearningService learning) : ControllerBase
     public Task<IActionResult> SubmitAnswers(int courseId, int sessionId, int quizId, [FromBody] SubmitAnswersRequest request) =>
         Run(() => Task.FromResult<IActionResult>(Ok(learning.SubmitAnswers(courseId, sessionId, quizId, request))));
 
+    // ── On the feedback screen, before the decision takes effect ──────────────
+
+    /// <summary>"That was a slip": answer one wrong question again (once per quiz).</summary>
+    [HttpPost("sessions/{sessionId:int}/quizzes/{quizId:int}/questions/{questionId:int}/slip")]
+    public Task<IActionResult> Slip(int courseId, int sessionId, int quizId, int questionId, [FromBody] SlipRequest request) =>
+        Run(() => Task.FromResult<IActionResult>(Ok(learning.MarkSlip(courseId, sessionId, quizId, questionId, request.Answer))));
+
+    /// <summary>"Report a wrong question": take it out of the score.</summary>
+    [HttpPost("sessions/{sessionId:int}/quizzes/{quizId:int}/questions/{questionId:int}/flag")]
+    public Task<IActionResult> Flag(int courseId, int sessionId, int quizId, int questionId) =>
+        Run(() => Task.FromResult<IActionResult>(Ok(learning.FlagQuestion(courseId, sessionId, quizId, questionId))));
+
+    /// <summary>"Next": apply the decision, with the level changes the learner chose to keep.</summary>
+    [HttpPost("sessions/{sessionId:int}/quizzes/{quizId:int}/finish")]
+    public Task<IActionResult> Finish(int courseId, int sessionId, int quizId, [FromBody] FinishQuizRequest request) =>
+        Run(() => { learning.FinishQuiz(courseId, sessionId, quizId, request); return Done(); });
+
+    // ── The learner's controls over what the tutor has stored ─────────────────
+
+    /// <summary>"Reset level" of one topic.</summary>
+    [HttpPost("topics/{topicId:int}/reset-level")]
+    public Task<IActionResult> ResetLevel(int courseId, int topicId) =>
+        Run(() => { learning.ResetLevel(courseId, topicId); return Done(); });
+
+    /// <summary>"Pause adaptation" on or off.</summary>
+    [HttpPost("adaptation")]
+    public Task<IActionResult> PauseAdaptation(int courseId, [FromBody] PauseRequest request) =>
+        Run(() => { learning.SetAdaptationPaused(courseId, request.Paused); return Done(); });
+
     /// <summary>Past sessions and per-topic progress and difficulty.</summary>
     [HttpGet("history")]
     public IActionResult GetHistory(int courseId) => Ok(learning.GetHistory(courseId));

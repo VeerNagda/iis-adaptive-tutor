@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useState } from "react";
 import { apiService } from "../../../services/apiService";
 
 // ─── Types (match the backend's Models/Learning.cs) ──────────────────────────
@@ -27,10 +27,19 @@ type TopicProgress = {
   statusEvidence: string | null; // how many questions the status rests on
   coverage: string; // thin, adequate or rich: how much source text the topic has
   coverageNote: string;
-  levelChanges: { oldLevel: number; newLevel: number; reason: string; at: string; evidence: string | null }[];
+  // choice: what the learner decided (accepted, kept, reset). null for older changes.
+  levelChanges: { oldLevel: number; newLevel: number; reason: string; at: string; evidence: string | null; choice: string | null }[];
 };
 
-type History = { sessions: SessionHistory[]; topics: TopicProgress[] };
+type History = {
+  // "What the tutor has stored about you"
+  adaptationPaused: boolean;
+  slips: number;
+  flaggedQuestions: number;
+  chatQuestions: number;
+  sessions: SessionHistory[];
+  topics: TopicProgress[];
+};
 
 const STATUS_STYLE: Record<string, string> = {
   new: "bg-zinc-100 text-zinc-600",
@@ -69,12 +78,28 @@ function HistoryContent() {
   const [history, setHistory] = useState<History | null>(null);
   const [error, setError] = useState("");
 
+  const load = useCallback(
+    () =>
+      apiService
+        .get<History>(`/courses/${courseId}/history`)
+        .then(setHistory)
+        .catch((e: Error) => setError(e.message)),
+    [courseId]
+  );
+
   useEffect(() => {
-    apiService
-      .get<History>(`/courses/${courseId}/history`)
-      .then(setHistory)
-      .catch((e: Error) => setError(e.message));
-  }, [courseId]);
+    load();
+  }, [load]);
+
+  // The learner's controls over what is stored. Each one reloads the page data.
+  async function control(path: string, body: unknown) {
+    try {
+      await apiService.post(`/courses/${courseId}/${path}`, body);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Something went wrong.");
+    }
+  }
 
   return (
     <div className="min-h-screen bg-zinc-50">
@@ -92,6 +117,67 @@ function HistoryContent() {
 
         {history && (
           <>
+            {/* Transparency and control: everything the adaptation is based on, with the means to change it. */}
+            <section className="rounded-2xl border border-zinc-200 bg-white p-6">
+              <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-zinc-500">What the tutor has stored about you</h2>
+              <p className="mb-4 text-xs text-zinc-500">
+                Only what is listed here, for this course. No name, no profile across courses.
+              </p>
+
+              <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-zinc-200 px-4 py-3">
+                <div className="mr-auto min-w-0">
+                  <p className="text-sm font-medium text-zinc-900">
+                    Adaptation is {history.adaptationPaused ? "paused" : "on"}
+                  </p>
+                  <p className="text-xs text-zinc-500">
+                    {history.adaptationPaused
+                      ? "Your levels stay where they are. Lessons, quizzes and tests carry on as usual."
+                      : "After a quiz the tutor may suggest a level change. You can keep your level each time."}
+                  </p>
+                </div>
+                <button
+                  onClick={() => control("adaptation", { paused: !history.adaptationPaused })}
+                  className="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+                >
+                  {history.adaptationPaused ? "Resume adaptation" : "Pause adaptation"}
+                </button>
+              </div>
+
+              <table className="mb-4 w-full text-left text-sm">
+                <thead className="text-xs text-zinc-500">
+                  <tr>
+                    <th className="pb-2 pr-4 font-medium">Topic</th>
+                    <th className="pb-2 pr-4 font-medium">Level</th>
+                    <th className="pb-2 pr-4 font-medium">Marked weak</th>
+                    <th className="pb-2 font-medium"></th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zinc-100">
+                  {history.topics.map((t) => (
+                    <tr key={t.id}>
+                      <td className="py-2 pr-4 text-zinc-800">{t.title}</td>
+                      <td className="py-2 pr-4 text-zinc-700">{t.level} / 5</td>
+                      <td className="py-2 pr-4 text-zinc-700">{t.status === "weak" ? "Yes" : "No"}</td>
+                      <td className="py-2 text-right">
+                        {t.level !== 3 && (
+                          <button
+                            onClick={() => control(`topics/${t.id}/reset-level`, {})}
+                            className="rounded border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
+                          >
+                            Reset level to 3
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+
+              <p className="text-xs text-zinc-600">
+                Slips you corrected: {history.slips} · Questions you reported: {history.flaggedQuestions} · Chat questions saved: {history.chatQuestions}
+              </p>
+            </section>
+
             {/* Per-topic progress and difficulty */}
             <section className="rounded-2xl border border-zinc-200 bg-white p-6">
               <h2 className="mb-4 text-xs font-semibold uppercase tracking-wider text-zinc-500">Topic progress and difficulty</h2>
@@ -120,10 +206,16 @@ function HistoryContent() {
                           {t.levelChanges.map((c, i) => (
                             <li key={i}>
                               <span className="text-zinc-400">{formatTime(c.at)}</span>{" "}
-                              Level {c.oldLevel} → {c.newLevel}{" "}
-                              <span className={c.newLevel > c.oldLevel ? "text-green-700" : "text-amber-700"}>
-                                ({c.newLevel > c.oldLevel ? "harder" : "easier"})
-                              </span>
+                              {c.choice === "kept" ? (
+                                <>Level {c.oldLevel} kept <span className="text-blue-700">(you chose to keep your level)</span></>
+                              ) : (
+                                <>
+                                  Level {c.oldLevel} → {c.newLevel}{" "}
+                                  <span className={c.newLevel > c.oldLevel ? "text-green-700" : "text-amber-700"}>
+                                    ({c.newLevel > c.oldLevel ? "harder" : "easier"})
+                                  </span>
+                                </>
+                              )}
                               : {c.reason}
                               {c.evidence && <span className="text-zinc-400"> · {c.evidence}</span>}
                             </li>

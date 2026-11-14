@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS courses (
     -- A mandatory topic test is due after this many completed topics: 2 or 3,
     -- picked at random. 0 means not picked yet.
     topic_test_every INTEGER NOT NULL DEFAULT 0,
+    -- 1 while the learner has paused adaptation: difficulty levels stay where they are.
+    adaptation_paused INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -144,7 +146,11 @@ CREATE TABLE IF NOT EXISTS learn_lessons (
 -- 8. One row per quiz
 --    kind is 'lesson' (after a lesson), 'checkpoint' (mixed test inside a topic),
 --    'retest' (after a review) or 'topic_test' (mandatory test over several topics)
---    correct and passed stay NULL until the learner submits answers
+--    A quiz is answered in two steps, so the learner can correct a slip, report a
+--    wrong question and decide about a level change before anything takes effect:
+--    submitted_at  the answers were handed in and the feedback is on screen
+--    completed_at  the learner moved on and the decision was applied
+--    correct and passed stay NULL until then
 CREATE TABLE IF NOT EXISTS learn_quizzes (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id   INTEGER NOT NULL,
@@ -156,6 +162,7 @@ CREATE TABLE IF NOT EXISTS learn_quizzes (
     passed       INTEGER,
     simulated    INTEGER NOT NULL DEFAULT 0,
     created_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+    submitted_at TEXT,
     completed_at TEXT,
     FOREIGN KEY (session_id) REFERENCES sessions(id)      ON DELETE CASCADE,
     FOREIGN KEY (topic_id)   REFERENCES topics(id)        ON DELETE CASCADE,
@@ -177,6 +184,8 @@ CREATE TABLE IF NOT EXISTS learn_questions (
     label         TEXT,               -- for example "Refresher from: Topic X"
     user_answer   INTEGER,
     is_correct    INTEGER,
+    slip          INTEGER NOT NULL DEFAULT 0,   -- 1 if the learner said "that was a slip" and answered again
+    flagged       INTEGER NOT NULL DEFAULT 0,   -- 1 if the learner reported the question as wrong: not scored, not reused
     FOREIGN KEY (quiz_id)  REFERENCES learn_quizzes(id) ON DELETE CASCADE,
     FOREIGN KEY (topic_id) REFERENCES topics(id)        ON DELETE CASCADE
 );
@@ -190,6 +199,9 @@ CREATE TABLE IF NOT EXISTS difficulty_history (
     new_level  INTEGER NOT NULL,
     reason     TEXT    NOT NULL,
     question_count INTEGER,   -- how many quiz questions the change was based on
+    -- what the learner chose: accepted, kept (old_level = new_level: they kept their level)
+    -- or reset (they reset the level themselves). NULL for changes made before the choice existed.
+    choice     TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (topic_id)   REFERENCES topics(id)   ON DELETE CASCADE,
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE SET NULL
@@ -226,6 +238,25 @@ CREATE TABLE IF NOT EXISTS capability_events (
     FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
 );
 
+-- 13. The "Ask the tutor" chat, kept per lesson so it survives a page refresh.
+--     source is where the answer comes from, as decided in C#: notes, general,
+--     none or out_of_scope. The quote, file and page are stored for "notes".
+CREATE TABLE IF NOT EXISTS lesson_chat (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    lesson_id       INTEGER NOT NULL,
+    question        TEXT NOT NULL,
+    answer          TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    source_quote    TEXT,
+    file_name       TEXT,
+    page_label      TEXT,
+    uploaded_at     TEXT,
+    from_picture    INTEGER NOT NULL DEFAULT 0,
+    can_ask_general INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (lesson_id) REFERENCES learn_lessons(id) ON DELETE CASCADE
+);
+
 -- ── Indexes ──────────────────────────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_documents_course       ON documents(course_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_document        ON chunks(document_id, chunk_index);
@@ -234,4 +265,5 @@ CREATE INDEX IF NOT EXISTS idx_topics_course          ON topics(course_id, seque
 CREATE INDEX IF NOT EXISTS idx_learn_lessons_session  ON learn_lessons(session_id, kind, step_index, attempt);
 CREATE INDEX IF NOT EXISTS idx_learn_quizzes_session  ON learn_quizzes(session_id);
 CREATE INDEX IF NOT EXISTS idx_learn_questions_quiz   ON learn_questions(quiz_id);
-CREATE INDEX IF NOT EXISTS idx_capability_events      ON capability_events(course_id, id)
+CREATE INDEX IF NOT EXISTS idx_capability_events      ON capability_events(course_id, id);
+CREATE INDEX IF NOT EXISTS idx_lesson_chat            ON lesson_chat(lesson_id, id)

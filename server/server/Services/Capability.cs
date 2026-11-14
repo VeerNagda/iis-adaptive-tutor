@@ -30,7 +30,6 @@ public static class Capability
         "It only knows your uploaded notes. It has not read your textbook or the internet.",
         "It can't show pictures, only describe them.",
         "It can't read standalone images, video, audio or ZIP files.",
-        "The chat on a lesson clears when you refresh the page.",
         "It can't predict exam questions or your grades.",
     ];
 
@@ -111,6 +110,29 @@ public static class Capability
     public const string GeneralAnswer = "general_answer";
     /// <summary>The learner asked for something the tutor cannot do and got the fixed reply.</summary>
     public const string OutOfScopeRequest = "out_of_scope";
+    /// <summary>The learner said a wrong answer was a slip and answered that question again.</summary>
+    public const string Slip = "slip";
+    /// <summary>The learner reported a quiz question as wrong.</summary>
+    public const string QuestionFlagged = "question_flagged";
+    /// <summary>A proposed level change was accepted, or overridden with "Keep my level".</summary>
+    public const string LevelChoice = "level_change";
+    /// <summary>The learner reset a topic's level themselves.</summary>
+    public const string LevelReset = "level_reset";
+    /// <summary>The learner paused or resumed adaptation.</summary>
+    public const string AdaptationPause = "adaptation_pause";
+
+    // ── Messages for the learner's own controls ───────────────────────────────
+
+    public const string SlipMessage =
+        "That was a slip: answer this question again, with no penalty. You can do this once per quiz.";
+    public const string FlagMessage =
+        "Thanks for reporting this question. It no longer counts towards your score and won't be used again.";
+    public const string PausedMessage =
+        "Adaptation is paused. Your difficulty levels stay where they are; lessons, quizzes and tests carry on as usual.";
+    public const string ResumedMessage =
+        "Adaptation is on. The tutor will suggest a level change after a quiz, and you can keep your level each time.";
+    public static string ResetMessage(string topicTitle, int level) =>
+        $"The level of \"{topicTitle}\" was set back to {level}.";
 
     /// <summary>Event types the browser may log itself (a choice the server never sees, such as "Cancel").</summary>
     public static readonly string[] ClientEvents = [ScopeWarning];

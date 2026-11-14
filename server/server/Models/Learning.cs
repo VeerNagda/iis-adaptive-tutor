@@ -198,6 +198,8 @@ public class LessonDto
     public int Id { get; set; }
     public string Text { get; set; } = "";
     public string? Example { get; set; }
+    /// <summary>The "Ask the tutor" chat saved for this lesson, oldest first.</summary>
+    public List<AskResponse> Chat { get; set; } = [];
 }
 
 public class QuizDto
@@ -221,21 +223,12 @@ public class AskRequest
 {
     public string Question { get; set; } = "";
     /// <summary>
-    /// Earlier questions and answers of this chat, oldest first. The browser keeps
-    /// the chat and sends it back, because the LLM has no memory between calls.
-    /// </summary>
-    public List<ChatTurn> History { get; set; } = [];
-    /// <summary>
     /// True only when the learner pressed "Answer from general knowledge anyway"
     /// after being told the notes do not cover the question.
     /// </summary>
     public bool AllowGeneral { get; set; }
-}
-
-public class ChatTurn
-{
-    public string Question { get; set; } = "";
-    public string Answer { get; set; } = "";
+    /// <summary>With AllowGeneral: the saved "couldn't find this" turn that the new answer replaces.</summary>
+    public int? ReplaceTurnId { get; set; }
 }
 
 /// <summary>
@@ -244,6 +237,9 @@ public class ChatTurn
 /// </summary>
 public class AskResponse
 {
+    /// <summary>Id of the saved chat turn (lesson_chat.id).</summary>
+    public int Id { get; set; }
+    public string Question { get; set; } = "";
     public string Answer { get; set; } = "";
     /// <summary>"notes", "general", "none" or "out_of_scope".</summary>
     public string Source { get; set; } = "";
@@ -281,6 +277,15 @@ public class AnswerResult
     public int NewLevel { get; set; }
     /// <summary>"Based on N questions": how much this result rests on.</summary>
     public string Evidence { get; set; } = "";
+    /// <summary>
+    /// Level changes the tutor wants to make. Nothing has changed yet: the learner
+    /// accepts each one or keeps their level, and it takes effect when they move on.
+    /// </summary>
+    public List<LevelProposal> LevelProposals { get; set; } = [];
+    /// <summary>Set when adaptation is paused, to say that the level was left alone.</summary>
+    public string? LevelNote { get; set; }
+    /// <summary>True while "That was a slip" can still be used on this quiz (one per quiz).</summary>
+    public bool SlipAvailable { get; set; }
     public List<QuestionFeedback> Questions { get; set; } = [];
     public List<TopicScore> TopicScores { get; set; } = [];   // checkpoints only
 }
@@ -297,6 +302,39 @@ public class QuestionFeedback
     public string? WhatWentWrong { get; set; }
     /// <summary>The words of the learner's notes the question is based on ("From your notes: ...").</summary>
     public string? SourceQuote { get; set; }
+    /// <summary>The learner said the first answer was a slip and answered this question again.</summary>
+    public bool Slip { get; set; }
+    /// <summary>The learner reported the question as wrong, so it is not counted in the score.</summary>
+    public bool Flagged { get; set; }
+}
+
+/// <summary>A level change waiting for the learner's decision.</summary>
+public class LevelProposal
+{
+    public int TopicId { get; set; }
+    public string TopicTitle { get; set; } = "";
+    public int OldLevel { get; set; }
+    public int NewLevel { get; set; }
+    /// <summary>For example "I'll make this easier because you got 2 wrong. Keep level 3 instead?"</summary>
+    public string Message { get; set; } = "";
+    public string Evidence { get; set; } = "";
+}
+
+/// <summary>Sent when the learner leaves the feedback screen: which levels they chose to keep.</summary>
+public class FinishQuizRequest
+{
+    public List<int> KeepLevelTopicIds { get; set; } = [];
+}
+
+public class SlipRequest
+{
+    /// <summary>The option the learner meant to pick.</summary>
+    public int Answer { get; set; }
+}
+
+public class PauseRequest
+{
+    public bool Paused { get; set; }
 }
 
 public class TopicScore
@@ -312,6 +350,11 @@ public class TopicScore
 
 public class HistoryResponse
 {
+    // "What the tutor has stored about you": everything the adaptation uses.
+    public bool AdaptationPaused { get; set; }
+    public int Slips { get; set; }
+    public int FlaggedQuestions { get; set; }
+    public int ChatQuestions { get; set; }
     public List<SessionHistory> Sessions { get; set; } = [];
     public List<TopicProgress> Topics { get; set; } = [];
 }
@@ -349,4 +392,6 @@ public class LevelChange
     public string At { get; set; } = "";
     /// <summary>"Based on N questions", or null for changes recorded before this was stored.</summary>
     public string? Evidence { get; set; }
+    /// <summary>accepted, kept or reset: what the learner chose. Null for older changes.</summary>
+    public string? Choice { get; set; }
 }

@@ -99,6 +99,14 @@ public static class DatabaseInitializer
         AddColumn(connection, "documents", "ingest_report", "TEXT");
         AddColumn(connection, "learn_questions", "source_quote", "TEXT");
         AddColumn(connection, "difficulty_history", "question_count", "INTEGER");
+        AddColumn(connection, "difficulty_history", "choice", "TEXT");
+        AddColumn(connection, "courses", "adaptation_paused", "INTEGER NOT NULL DEFAULT 0");
+        AddColumn(connection, "learn_questions", "slip", "INTEGER NOT NULL DEFAULT 0");
+        AddColumn(connection, "learn_questions", "flagged", "INTEGER NOT NULL DEFAULT 0");
+
+        // Quizzes finished before the two-step flow existed count as submitted too.
+        if (AddColumn(connection, "learn_quizzes", "submitted_at", "TEXT"))
+            Exec(connection, "UPDATE learn_quizzes SET submitted_at = completed_at WHERE completed_at IS NOT NULL");
 
         // Documents whose topics already exist must not be extracted a second time.
         if (AddColumn(connection, "documents", "topics_extracted", "INTEGER NOT NULL DEFAULT 0"))

@@ -98,7 +98,7 @@ public sealed class MockLlmProvider : ILlmProvider
             lesson_text = lessonText,
             example = "(MOCK example) A real LLM would give one concrete example or analogy here.",
             insight = "(MOCK insight) A real LLM would add one extra interesting point from the material.",
-            questions = MockQuestions(title, Prompts.QuizSize, SourceExcerpt(prompt, 10))
+            questions = MockQuestions(title, Prompts.QuizSize, SourceExcerpt(prompt, 10), flawedLast: true)
         });
     }
 
@@ -184,17 +184,26 @@ public sealed class MockLlmProvider : ILlmProvider
     /// sourceQuote is a real piece of the source text, so the questions pass the
     /// C# check that every question quotes the learner's notes.
     /// </summary>
-    private static object[] MockQuestions(string title, int count, string sourceQuote)
+    ///
+    /// flawedLast: the last question is deliberately flawed. Two of its options
+    /// read "The correct answer" but only the second one is marked correct, which
+    /// is the kind of mistake a real model can make. It lets "Report a wrong
+    /// question" be demonstrated: once reported, it no longer counts.
+    private static object[] MockQuestions(string title, int count, string sourceQuote, bool flawedLast = false)
     {
         int set = Random.Shared.Next(100, 999);
         return Enumerable.Range(0, count).Select(i =>
         {
             int correct = (i + 1) % 4;
+            bool flawed = flawedLast && i == count - 1;
+            int duplicate = (correct + 1) % 4;   // only used by the flawed question
             return (object)new
             {
-                text = $"(MOCK question {i + 1}, set {set}) Which option is the correct one for \"{title}\"?",
+                text = flawed
+                    ? $"(MOCK question {i + 1}, set {set}, deliberately flawed: two options read the same) Which option is the correct one for \"{title}\"?"
+                    : $"(MOCK question {i + 1}, set {set}) Which option is the correct one for \"{title}\"?",
                 options = Enumerable.Range(0, 4)
-                    .Select(o => o == correct ? "The correct answer" : $"A wrong answer ({(char)('A' + o)})")
+                    .Select(o => o == correct || (flawed && o == duplicate) ? "The correct answer" : $"A wrong answer ({(char)('A' + o)})")
                     .ToArray(),
                 correct_index = correct,
                 explanation = "(MOCK explanation) A real LLM would explain here why this option is right.",
