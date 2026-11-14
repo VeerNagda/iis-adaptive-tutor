@@ -181,7 +181,7 @@ public sealed class IngestionService(
             List<string> descriptions;
             try
             {
-                descriptions = JsonSerializer.Deserialize<Models.LlmImageDescriptions>(json)?.Descriptions ?? [];
+                descriptions = JsonSerializer.Deserialize<Models.LlmImageDescriptions>(LlmJson.Extract(json))?.Descriptions ?? [];
             }
             catch (JsonException ex)
             {
@@ -301,7 +301,7 @@ public sealed class IngestionService(
 
     private static List<Section> ParseSections(string json)
     {
-        using var doc = JsonDocument.Parse(json);
+        using var doc = JsonDocument.Parse(LlmJson.Extract(json));
         var root = doc.RootElement.GetProperty("sections");
         var sections = new List<Section>();
 

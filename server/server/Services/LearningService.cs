@@ -1274,11 +1274,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         try
         {
             // Some models wrap JSON in ```json fences even when asked not to.
-            var json = raw.Trim();
-            if (json.StartsWith("```"))
-                json = json[(json.IndexOf('\n') + 1)..json.LastIndexOf("```")];
-
-            return JsonSerializer.Deserialize<T>(json)
+            return JsonSerializer.Deserialize<T>(LlmJson.Extract(raw))
                 ?? throw new JsonException("Reply was null.");
         }
         catch (Exception ex) when (ex is JsonException or ArgumentOutOfRangeException)

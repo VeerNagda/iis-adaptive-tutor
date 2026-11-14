@@ -28,6 +28,22 @@ public sealed class LlmException(string message, Exception? inner = null)
     : Exception(message, inner);
 
 /// <summary>
+/// Cleans an LLM reply before it is parsed as JSON. Even when asked for JSON
+/// only, a model sometimes wraps the object in ```json fences or adds stray
+/// characters before or after it. Every reply in this app is one JSON object,
+/// so everything outside the first '{' and the last '}' is dropped.
+/// </summary>
+public static class LlmJson
+{
+    public static string Extract(string reply)
+    {
+        int start = reply.IndexOf('{');
+        int end = reply.LastIndexOf('}');
+        return start >= 0 && end > start ? reply[start..(end + 1)] : reply;
+    }
+}
+
+/// <summary>
 /// Finds the Gemini API key. The key is never stored in source control:
 ///   1. environment variable GEMINI_API_KEY (preferred), or
 ///   2. config value GeminiAPI:APIKEY (dotnet user-secrets, or the git-ignored
