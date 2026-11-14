@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { Suspense, useCallback, useEffect, useState } from "react";
+import { type FormEvent, Suspense, useCallback, useEffect, useState } from "react";
 import { MockBadge } from "../../../../components/MockBadge";
 import { apiService } from "../../../../services/apiService";
 
@@ -97,7 +97,86 @@ function ReasonLabel({ text }: { text: string }) {
   );
 }
 
-function LessonView({ step, busy, onAction }: { step: Step; busy: boolean; onAction: (a: "continue" | "explain" | "skip") => void }) {
+// User control: the learner can clear up a doubt before moving on to the quiz.
+// The chat lives only in this component: the server answers each question from
+// the lesson and the uploaded material, and is sent the earlier turns so that
+// follow-up questions make sense. Asking never changes the difficulty level.
+type ChatTurn = { question: string; answer: string };
+
+function LessonChat({ askUrl, disabled }: { askUrl: string; disabled: boolean }) {
+  const [turns, setTurns] = useState<ChatTurn[]>([]);
+  const [draft, setDraft] = useState("");
+  const [asking, setAsking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function ask(e: FormEvent) {
+    e.preventDefault();
+    const question = draft.trim();
+    if (!question || asking) return;
+    setAsking(true);
+    setError(null);
+    try {
+      const { answer } = await apiService.post<{ answer: string }>(askUrl, { question, history: turns });
+      setTurns((prev) => [...prev, { question, answer }]);
+      setDraft("");
+    } catch (err) {
+      // The question stays in the box so it can be sent again.
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+    } finally {
+      setAsking(false);
+    }
+  }
+
+  return (
+    <div className="mt-6 rounded-xl border border-zinc-200 p-4">
+      <p className="text-sm font-semibold text-zinc-900">Have a doubt? Ask the tutor</p>
+      <p className="mt-0.5 text-xs text-zinc-500">
+        Answers come from this lesson and your uploaded material. Asking does not affect your difficulty level.
+      </p>
+
+      {turns.length > 0 && (
+        <ul className="mt-3 space-y-3" aria-live="polite">
+          {turns.map((t, i) => (
+            <li key={i} className="space-y-1.5 text-sm">
+              <p className="ml-8 rounded-lg bg-zinc-900 px-3 py-2 text-white">{t.question}</p>
+              <p className="mr-8 whitespace-pre-wrap rounded-lg bg-zinc-100 px-3 py-2 leading-relaxed text-zinc-800">{t.answer}</p>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {asking && <p className="mt-3 text-xs text-zinc-500">The tutor is writing an answer…</p>}
+      {error && <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600">{error}</p>}
+
+      <form onSubmit={ask} className="mt-3 flex gap-2">
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          maxLength={500}
+          placeholder="Type your question about this lesson…"
+          aria-label="Your question about this lesson"
+          className="min-w-0 flex-1 rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-900 focus:outline-none"
+        />
+        <button
+          type="submit"
+          disabled={disabled || asking || !draft.trim()}
+          className="rounded-lg border border-zinc-300 px-4 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+        >
+          Ask
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function LessonView({
+  step, busy, askUrl, onAction,
+}: {
+  step: Step;
+  busy: boolean;
+  askUrl: string;
+  onAction: (a: "continue" | "explain" | "skip") => void;
+}) {
   const lesson = step.lesson!;
   return (
     <div>
@@ -112,6 +191,8 @@ function LessonView({ step, busy, onAction }: { step: Step; busy: boolean; onAct
           <p className="whitespace-pre-wrap text-sm leading-relaxed text-zinc-700">{lesson.example}</p>
         </div>
       )}
+      {/* key: a new lesson (next step or a re-explanation) starts an empty chat. */}
+      <LessonChat key={lesson.id} askUrl={askUrl} disabled={busy} />
       <div className="mt-6 flex flex-wrap gap-2">
         <button
           onClick={() => onAction("continue")}
@@ -430,7 +511,7 @@ function SessionContent() {
           )}
 
           {view.kind === "step" && view.step.type === "lesson" && (
-            <LessonView step={view.step} busy={busy} onAction={act} />
+            <LessonView step={view.step} busy={busy} askUrl={`${base}/ask`} onAction={act} />
           )}
 
           {view.kind === "step" && view.step.type === "quiz" && (

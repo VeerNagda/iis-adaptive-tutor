@@ -332,6 +332,53 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         SaveSession(conn, session);
     }
 
+    /// <summary>Longest question accepted, in characters (keeps the prompt a bounded size).</summary>
+    private const int MaxQuestionLength = 500;
+    /// <summary>Only the most recent turns of the chat are sent back to the LLM.</summary>
+    private const int MaxChatTurns = 5;
+
+    /// <summary>
+    /// "Ask the tutor": answers a question about the lesson on screen, using the
+    /// lesson text and the same source text the lesson was written from.
+    /// It changes nothing: the session stays on the lesson and the difficulty
+    /// level is untouched (only quiz results change the level).
+    /// </summary>
+    public async Task<AskResponse> AskQuestionAsync(int courseId, int sessionId, AskRequest request, CancellationToken ct)
+    {
+        var question = request.Question.Trim();
+        if (question.Length == 0) throw new LearningException("Please type a question.");
+        if (question.Length > MaxQuestionLength)
+            throw new LearningException($"Please keep your question under {MaxQuestionLength} characters.");
+
+        using var conn = db.CreateConnection();
+        var session = LoadSession(conn, courseId, sessionId) ?? throw new LearningException("Session not found.");
+        // Only while a lesson is shown: during a quiz the tutor would be giving away answers.
+        if (session.Phase is not ("lesson" or "review"))
+            throw new LearningException("You can ask a question while a lesson is on screen.");
+
+        var topic = LoadTopic(conn, session.TopicId);
+        bool isReview = session.Phase == "review";
+        var lesson = (isReview
+                ? FindLesson(conn, session.Id, "review", session.CheckpointFrom, session.ReviewRound)
+                : FindLesson(conn, session.Id, "lesson", session.StepIndex, session.Attempt))
+            ?? throw new LearningException("There is no lesson to ask about yet.");
+        var source = isReview
+            ? StepsSource(conn, topic, session.CheckpointFrom, session.StepIndex - 1)
+            : StepsSource(conn, topic, session.StepIndex, session.StepIndex);
+
+        var history = request.History
+            .TakeLast(MaxChatTurns)
+            .Select(t => (t.Question, t.Answer))
+            .ToList();
+
+        var reply = await AskAsync<LlmAnswer>(
+            Prompts.Ask(topic.Title, source, topic.DifficultyLevel, lesson.Text, history, question), ct);
+        if (string.IsNullOrWhiteSpace(reply.Answer))
+            throw new LlmException("The AI returned an empty answer. Please ask again.");
+
+        return new AskResponse { Answer = reply.Answer.Trim() };
+    }
+
     /// <summary>"Skip / I know this": move on without taking the quiz.</summary>
     public void Skip(int courseId, int sessionId)
     {

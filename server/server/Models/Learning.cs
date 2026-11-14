@@ -55,6 +55,12 @@ public class Topic
 {
     public int Id { get; set; }
     public int CourseId { get; set; }
+/// <summary>The tutor's answer to a question the learner asked about a lesson.</summary>
+public class LlmAnswer
+{
+    [JsonPropertyName("answer")] public string Answer { get; set; } = "";
+}
+
     public string Title { get; set; } = "";
     public string? Summary { get; set; }
     public int SequenceNumber { get; set; }
@@ -146,6 +152,28 @@ public class SubmitAnswersRequest
     public List<int> Answers { get; set; } = [];
     /// <summary>Demo mode: the server fills in wrong answers so the re-teach path can be shown.</summary>
     public bool SimulateWrong { get; set; }
+/// <summary>A question the learner asks about the lesson on screen ("Ask the tutor").</summary>
+public class AskRequest
+{
+    public string Question { get; set; } = "";
+    /// <summary>
+    /// Earlier questions and answers of this chat, oldest first. The browser keeps
+    /// the chat and sends it back, because the LLM has no memory between calls.
+    /// </summary>
+    public List<ChatTurn> History { get; set; } = [];
+}
+
+public class ChatTurn
+{
+    public string Question { get; set; } = "";
+    public string Answer { get; set; } = "";
+}
+
+public class AskResponse
+{
+    public string Answer { get; set; } = "";
+}
+
 }
 
 public class AnswerResult

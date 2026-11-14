@@ -20,6 +20,7 @@ public static class Prompts
     public const string LessonTask = "[[TASK:LESSON]]";
     public const string CheckpointTask = "[[TASK:CHECKPOINT]]";
 
+    public const string AskTask = "[[TASK:ASK]]";
     /// <summary>Questions per lesson quiz. Pass = at most one mistake (see LearningService).</summary>
     public const int QuizSize = 3;
 
@@ -196,3 +197,58 @@ public static class Prompts
         SOURCE>>>
         """;
 }
+    // ── Ask the tutor: answer a learner's question about the lesson on screen ─
+    // The model has no memory between calls, so everything it needs is sent
+    // again each time:
+    //   lessonText  the explanation the learner is looking at (so "what do you
+    //               mean by X?" can be answered about the actual wording);
+    //   source      the same uploaded text the lesson was written from, which
+    //               keeps the answer grounded in the learner's own material;
+    //   history     the earlier questions and answers of this chat, so a
+    //               follow-up such as "why?" makes sense;
+    //   level       the same teaching style as the lesson (StyleForLevel).
+    // The reply is JSON with one field, like every other prompt, so it goes
+    // through the same parsing and error handling. Asking a question never
+    // changes the difficulty level: that is decided only by quiz results.
+    public static string Ask(
+        string topicTitle, string source, int level, string lessonText,
+        IReadOnlyList<(string Question, string Answer)> history, string question)
+    {
+        var earlier = history.Count == 0
+            ? "none"
+            : string.Join("\n", history.Select(h => $"Learner: {h.Question}\nTutor: {h.Answer}"));
+
+        return $$"""
+            {{AskTask}}
+            You are a patient tutor. The learner has just read the LESSON below, part of the
+            topic "{{topicTitle}}", and has a question about it before taking the quiz.
+
+            Answer the QUESTION directly in at most 120 words.
+            GROUNDING: use only facts found in SOURCE and LESSON. Do not add outside knowledge.
+            If they do not cover the question, say that the uploaded material does not cover it
+            and point the learner to the closest idea that it does cover.
+            Do not write quiz questions and do not reveal quiz answers.
+
+            DIFFICULTY LEVEL: {{level}} of 5 (1 = easiest, 5 = hardest)
+            TEACHING STYLE for this level (follow its wording guidance; ignore its word count and quiz guidance):
+            {{StyleForLevel(level)}}
+
+            Return JSON only, in exactly this shape:
+            {"answer":"..."}
+
+            <<<SOURCE
+            {{source}}
+            SOURCE>>>
+
+            LESSON:
+            {{lessonText}}
+
+            EARLIER IN THIS CHAT:
+            {{earlier}}
+
+            <<<QUESTION
+            {{question}}
+            QUESTION>>>
+            """;
+    }
+

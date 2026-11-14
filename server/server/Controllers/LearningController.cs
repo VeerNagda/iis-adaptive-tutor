@@ -54,6 +54,11 @@ public class LearningController(LearningService learning) : ControllerBase
     public Task<IActionResult> Explain(int courseId, int sessionId) =>
         Run(() => { learning.ExplainDifferently(courseId, sessionId); return Done(); });
 
+    /// <summary>"Ask the tutor": answer a question about the lesson on screen.</summary>
+    [HttpPost("sessions/{sessionId:int}/ask")]
+    public Task<IActionResult> Ask(int courseId, int sessionId, [FromBody] AskRequest request, CancellationToken ct) =>
+        Run(async () => Ok(await learning.AskQuestionAsync(courseId, sessionId, request, ct)));
+
     /// <summary>"Skip / I know this": move on without the quiz.</summary>
     [HttpPost("sessions/{sessionId:int}/skip")]
     public Task<IActionResult> Skip(int courseId, int sessionId) =>

@@ -21,6 +21,7 @@ public sealed class MockLlmProvider : ILlmProvider
             prompt.Contains(Prompts.SectionsTask) ? MockSections(prompt) :
             prompt.Contains(Prompts.TopicsTask) ? MockTopics(prompt) :
             prompt.Contains(Prompts.LessonTask) ? MockLesson(prompt) :
+            prompt.Contains(Prompts.AskTask) ? MockAnswer(prompt) :
             prompt.Contains(Prompts.CheckpointTask) ? MockCheckpoint(prompt) :
             """{"error":"MockLlmProvider: unrecognised task marker."}""";
 
@@ -109,6 +110,17 @@ public sealed class MockLlmProvider : ILlmProvider
     /// <summary>
     /// Canned questions. A random set number makes every quiz "new" (as a real
     /// re-quiz would be), and the correct option moves between questions.
+    // ── Ask the tutor: echoes the question so the chat is visibly working ─────
+    private static string MockAnswer(string prompt)
+    {
+        var question = Regex.Match(prompt, @"<<<QUESTION\s*(.*?)\s*QUESTION>>>", RegexOptions.Singleline).Groups[1].Value;
+        return JsonSerializer.Serialize(new
+        {
+            answer = $"(MOCK answer) You asked: \"{question}\". A real LLM would answer this here, "
+                + "using only the lesson and the uploaded material."
+        });
+    }
+
     /// </summary>
     private static object[] MockQuestions(string title, int count)
     {

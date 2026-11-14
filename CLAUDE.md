@@ -37,6 +37,12 @@ A topic's source chunks are spread over at most 6 lesson steps. Per step:
 ### Difficulty and teaching style
 - Level 1 (easiest) to 5 (hardest) per topic, starts at 3, stored on the topic and reused in later sessions.
 - `Prompts.StyleForLevel` maps each level to explicit style instructions (L1 plain language, analogy, small steps; L3 standard; L5 concise, technical, edge cases).
+### Ask the tutor (chat on a lesson)
+- Under every lesson and review lesson the learner can type a question before taking the quiz.
+- One LLM call per question (`Prompts.Ask`), grounded in the lesson text and that step's source text, written in the style of the topic's current level.
+- The chat is kept in the browser and the last 5 turns are sent back with each question, so follow-ups work. It is not stored, and a new lesson starts an empty chat.
+- Asking changes nothing: no phase change and no level change. Not available during a quiz.
+
 - Every change is written to `difficulty_history` with its reason.
 
 ### Checkpoint test (inside a topic)
@@ -62,7 +68,7 @@ A topic's source chunks are spread over at most 6 lesson steps. Per step:
 
 ### Frontend principles
 - Progress bar (visibility of system status).
-- "Explain differently" and "Skip / I know this" buttons (user control).
+- "Explain differently" and "Skip / I know this" buttons, and the "Ask the tutor" chat (user control).
 - Per-answer feedback with the explanation, including what went wrong.
 - A "Why am I seeing this?" label on re-taught content, checkpoints and reviews (transparency).
 - A "Demo mode" button that submits wrong answers so the adaptive path can be shown reliably; results are labelled as simulated.
