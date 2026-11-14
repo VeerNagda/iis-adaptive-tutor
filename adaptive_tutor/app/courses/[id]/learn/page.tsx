@@ -174,7 +174,9 @@ function CapabilityCard() {
 
 // ─── Materials: the uploaded files the topics are extracted from ─────────────
 
-function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested: () => void }) {
+// refresh changes when the topic list has loaded: the file cards are then fetched again,
+// because their reports include how many topics use each file.
+function MaterialsPanel({ courseId, onIngested, refresh }: { courseId: string; onIngested: () => void; refresh: number }) {
   const [docs, setDocs] = useState<Document[]>([]);
   const [uploading, setUploading] = useState(false);
   const [ingestingId, setIngestingId] = useState<number | null>(null);
@@ -194,7 +196,7 @@ function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested
 
   useEffect(() => {
     fetchDocs();
-  }, [fetchDocs]);
+  }, [fetchDocs, refresh]);
 
   async function handleFiles(files: FileList | null) {
     if (!files || files.length === 0) return;
@@ -364,7 +366,7 @@ function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested
 
 // ─── Topics: pick one to start a learning session ────────────────────────────
 
-function TopicsPanel({ courseId, onMockMode }: { courseId: string; onMockMode: (mock: boolean) => void }) {
+function TopicsPanel({ courseId, onMockMode, onLoaded }: { courseId: string; onMockMode: (mock: boolean) => void; onLoaded: () => void }) {
   const router = useRouter();
   const [data, setData] = useState<TopicList | null>(null);
   const [loading, setLoading] = useState(true);
@@ -380,10 +382,11 @@ function TopicsPanel({ courseId, onMockMode }: { courseId: string; onMockMode: (
           setData(d);
           setError("");
           onMockMode(d.mockMode);
+          onLoaded();
         })
         .catch((e: Error) => setError(e.message))
         .finally(() => setLoading(false)),
-    [courseId, onMockMode]
+    [courseId, onMockMode, onLoaded]
   );
 
   useEffect(() => {
@@ -526,6 +529,9 @@ function LearnContent() {
   const [mockMode, setMockMode] = useState(false);
   // Increased after a file is ingested: remounts the topics panel so it reloads.
   const [topicsVersion, setTopicsVersion] = useState(0);
+  // Increased each time the topic list has loaded: tells the materials panel to reload its reports.
+  const [topicsLoaded, setTopicsLoaded] = useState(0);
+  const onTopicsLoaded = useCallback(() => setTopicsLoaded((v) => v + 1), []);
 
   useEffect(() => {
     apiService.get<Course>(`/courses/${id}`).then(setCourse).catch(() => {});
@@ -552,10 +558,10 @@ function LearnContent() {
 
       <main className="mx-auto grid max-w-6xl grid-cols-1 gap-6 px-6 py-8 lg:grid-cols-3">
         <div className="lg:col-span-2">
-          <TopicsPanel key={topicsVersion} courseId={id} onMockMode={setMockMode} />
+          <TopicsPanel key={topicsVersion} courseId={id} onMockMode={setMockMode} onLoaded={onTopicsLoaded} />
         </div>
         <div className="space-y-6">
-          <MaterialsPanel courseId={id} onIngested={() => setTopicsVersion((v) => v + 1)} />
+          <MaterialsPanel courseId={id} onIngested={() => setTopicsVersion((v) => v + 1)} refresh={topicsLoaded} />
           <CapabilityCard />
         </div>
       </main>

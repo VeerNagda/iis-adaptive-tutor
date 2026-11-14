@@ -441,11 +441,19 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     /// </summary>
     private static void SaveChatTurn(SqliteConnection conn, int lessonId, AskResponse turn, int? replaceId)
     {
-        if (replaceId is not null)
-            Exec(conn, "DELETE FROM lesson_chat WHERE id = $id AND lesson_id = $l AND source = 'none'",
-                ("$id", replaceId), ("$l", lessonId));
+        // Updated in place, so the question keeps its position in the chat.
+        var replaced = replaceId is null ? null : Scalar(conn, """
+            UPDATE lesson_chat
+            SET answer = $a, source = $source, source_quote = $quote, file_name = $file, page_label = $page,
+                uploaded_at = $uploaded, from_picture = $picture, can_ask_general = $general
+            WHERE id = $id AND lesson_id = $l AND source = 'none' RETURNING id
+            """,
+            ("$id", replaceId), ("$l", lessonId), ("$a", turn.Answer), ("$source", turn.Source),
+            ("$quote", turn.SourceQuote), ("$file", turn.FileName), ("$page", turn.PageLabel),
+            ("$uploaded", turn.UploadedAt), ("$picture", turn.FromPictureDescription ? 1 : 0),
+            ("$general", turn.CanAskGeneral ? 1 : 0));
 
-        turn.Id = Convert.ToInt32(Scalar(conn, """
+        turn.Id = Convert.ToInt32(replaced ?? Scalar(conn, """
             INSERT INTO lesson_chat (lesson_id, question, answer, source, source_quote, file_name, page_label,
                                      uploaded_at, from_picture, can_ask_general)
             VALUES ($l, $q, $a, $source, $quote, $file, $page, $uploaded, $picture, $general) RETURNING id
@@ -475,7 +483,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         if (reply.Intent == "out_of_scope")
         {
             string template = Capability.OutOfScope(reply.OutOfScopeKind);
-            Capability.Log(conn, courseId, Capability.OutOfScopeRequest, template, reply.OutOfScopeKind);
+            // Nothing was chosen here; the kind of request is recorded in place of a choice.
+            Capability.Log(conn, courseId, Capability.OutOfScopeRequest, template, $"Asked for: {reply.OutOfScopeKind ?? "other"}");
             return new AskResponse { Answer = template, Source = "out_of_scope", Label = Capability.OutsideTutor };
         }
 
