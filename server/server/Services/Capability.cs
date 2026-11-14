@@ -68,11 +68,37 @@ public static class Capability
     public const string NotFound = "I couldn't find this in your material.";
     public const string AskGeneralAnyway = "Answer from general knowledge anyway";
 
+    public const string OutsideTutor = "Outside what this tutor can do";
+
     public static string SourceLabel(string source) => source switch
     {
         "notes" => FromNotes,
         "general" => GeneralKnowledge,
+        "out_of_scope" => OutsideTutor,
         _ => NotFound,
+    };
+
+    // ── Out-of-scope requests ─────────────────────────────────────────────────
+    // The model only classifies the request (see Prompts.Ask). The reply is one
+    // of these fixed texts: what the limit is, and what the learner can do instead.
+
+    public static string OutOfScope(string? kind) => kind switch
+    {
+        "exam_prediction" =>
+            "I can't predict what will be on your exam. I only know the notes you uploaded, not what your lecturer will ask. "
+            + "What I can do: quiz you on these notes, so you can see which parts you know.",
+        "grades" =>
+            "I can't tell you what grade you will get. My quizzes are short and only cover these notes, so they don't measure your mark. "
+            + "What I can do: show your quiz and test results on the History page.",
+        "other_course" =>
+            "I only know the notes uploaded to this course. "
+            + "For another subject, create a course for it and upload its notes.",
+        "show_image" =>
+            "I can't show pictures. I can describe the pictures in your notes in words, so ask me what a picture shows, "
+            + "or open the original file to see it.",
+        _ =>
+            "That is outside what I can help with here. "
+            + "I can explain this lesson, answer questions about your notes, and quiz you.",
     };
 
     // ── Event log (evidence for the report) ───────────────────────────────────
@@ -83,6 +109,8 @@ public static class Capability
     public const string SourceDowngrade = "source_downgrade";
     /// <summary>The notes had no answer and the learner asked for a general-knowledge one.</summary>
     public const string GeneralAnswer = "general_answer";
+    /// <summary>The learner asked for something the tutor cannot do and got the fixed reply.</summary>
+    public const string OutOfScopeRequest = "out_of_scope";
 
     /// <summary>Event types the browser may log itself (a choice the server never sees, such as "Cancel").</summary>
     public static readonly string[] ClientEvents = [ScopeWarning];

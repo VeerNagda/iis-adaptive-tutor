@@ -37,6 +37,7 @@ type AnswerResult = {
   insight: string | null;
   oldLevel: number;
   newLevel: number;
+  evidence: string; // "Based on N questions"
   questions: {
     questionId: number;
     userAnswer: number;
@@ -46,7 +47,7 @@ type AnswerResult = {
     whatWentWrong: string | null; // why the option the learner picked is wrong
     sourceQuote: string | null; // the words of the notes the question is based on
   }[];
-  topicScores: { topicId: number; topicTitle: string; correct: number; total: number; scorePct: number; isWeak: boolean }[];
+  topicScores: { topicId: number; topicTitle: string; correct: number; total: number; scorePct: number; isWeak: boolean; evidence: string }[];
 };
 
 // The page is always in exactly one of these states.
@@ -107,7 +108,8 @@ function ReasonLabel({ text }: { text: string }) {
 // the label: "notes" only when it found the quote in the uploaded material.
 type ChatAnswer = {
   answer: string;
-  source: "notes" | "general" | "none";
+  // out_of_scope: something the tutor cannot do; the answer is then a fixed text from the server.
+  source: "notes" | "general" | "none" | "out_of_scope";
   label: string; // badge text, written by the server
   sourceQuote: string | null;
   fileName: string | null;
@@ -122,6 +124,7 @@ const SOURCE_STYLE: Record<ChatAnswer["source"], string> = {
   notes: "bg-green-100 text-green-800",
   general: "bg-amber-100 text-amber-900",
   none: "bg-zinc-200 text-zinc-700",
+  out_of_scope: "bg-purple-100 text-purple-800",
 };
 
 // SQLite stores UTC timestamps as "YYYY-MM-DD HH:MM:SS"; show the local date.
@@ -385,6 +388,8 @@ function FeedbackView({ step, result, busy, onNext }: { step: Step; result: Answ
       <div className={`mb-4 rounded-xl border px-4 py-3 ${result.passed ? "border-green-200 bg-green-50" : "border-amber-200 bg-amber-50"}`}>
         <p className="text-sm font-semibold text-zinc-900">
           Score: {result.correct} / {result.total}
+          {/* A short quiz is weak evidence, so the number of questions is always stated. */}
+          <span className="ml-2 text-xs font-normal text-zinc-500">{result.evidence}</span>
           {result.simulated && (
             <span className="ml-2 rounded-full bg-amber-200 px-2 py-0.5 text-xs font-medium text-amber-900">
               simulated answers (demo mode)
@@ -411,7 +416,8 @@ function FeedbackView({ step, result, busy, onNext }: { step: Step; result: Answ
         {result.newLevel !== result.oldLevel && (
           <p className="mt-2 text-xs text-zinc-600">
             Difficulty level changed from {result.oldLevel} to {result.newLevel} (
-            {result.newLevel > result.oldLevel ? "harder, because you answered everything correctly" : "easier, to help you get there"}).
+            {result.newLevel > result.oldLevel ? "harder, because you answered everything correctly" : "easier, to help you get there"}).{" "}
+            {result.evidence}.
           </p>
         )}
       </div>
@@ -426,6 +432,7 @@ function FeedbackView({ step, result, busy, onNext }: { step: Step; result: Answ
                 <span className="truncate text-zinc-700">{t.topicTitle}</span>
                 <span className={`shrink-0 font-medium ${t.isWeak ? "text-amber-700" : "text-green-700"}`}>
                   {t.correct}/{t.total} ({t.scorePct}%){t.isWeak ? " · weak" : ""}
+                  <span className="ml-2 font-normal text-zinc-500">{t.evidence}</span>
                 </span>
               </li>
             ))}

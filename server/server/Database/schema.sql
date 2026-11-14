@@ -189,6 +189,7 @@ CREATE TABLE IF NOT EXISTS difficulty_history (
     old_level  INTEGER NOT NULL,
     new_level  INTEGER NOT NULL,
     reason     TEXT    NOT NULL,
+    question_count INTEGER,   -- how many quiz questions the change was based on
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (topic_id)   REFERENCES topics(id)   ON DELETE CASCADE,
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE SET NULL

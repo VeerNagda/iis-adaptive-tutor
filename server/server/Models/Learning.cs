@@ -63,6 +63,10 @@ public class LlmQuestion
 /// <summary>The tutor's answer to a question the learner asked about a lesson.</summary>
 public class LlmAnswer
 {
+    /// <summary>"in_scope" or "out_of_scope": the model only classifies; C# writes the reply for the latter.</summary>
+    [JsonPropertyName("intent")] public string Intent { get; set; } = "in_scope";
+    /// <summary>For out_of_scope: exam_prediction, grades, other_course or show_image.</summary>
+    [JsonPropertyName("out_of_scope_kind")] public string? OutOfScopeKind { get; set; }
     /// <summary>Where the model says the answer comes from: "notes", "general" or "none".</summary>
     [JsonPropertyName("source")] public string Source { get; set; } = "";
     /// <summary>For "notes": words copied from a passage. Checked in C# before it is believed.</summary>
@@ -92,6 +96,48 @@ public class Topic
     [JsonIgnore] public List<int> ChunkIds { get; set; } = [];
     /// <summary>Not sent to the browser; characters of source text, which sets the number of lessons.</summary>
     [JsonIgnore] public int SourceLength { get; set; }
+    [JsonIgnore] public int? LastTestCorrect { get; set; }
+    [JsonIgnore] public int? LastTestTotal { get; set; }
+
+    // ── How much evidence there is (both computed in C# from stored numbers) ──
+
+    /// <summary>
+    /// What the status rests on. A handful of multiple-choice questions is weak
+    /// evidence, so the number is always shown next to the status. Null before any test.
+    /// </summary>
+    public string? StatusEvidence => LastTestTotal is null
+        ? null
+        : $"{Evidence.BasedOn(LastTestTotal.Value)} in the last test ({LastTestCorrect} correct)";
+
+    /// <summary>"thin", "adequate" or "rich": how much source text the topic has.</summary>
+    public string Coverage => Evidence.Coverage(SourceLength);
+    public string CoverageNote => Evidence.CoverageNote(Coverage);
+}
+
+/// <summary>
+/// Plain rules and wording for "how sure can the tutor be?". Kept as constants
+/// and templates so the numbers are the same wherever they are shown.
+/// </summary>
+public static class Evidence
+{
+    /// <summary>Shown next to every score, level change and status.</summary>
+    public static string BasedOn(int questions) =>
+        questions == 1 ? "Based on 1 question" : $"Based on {questions} questions";
+
+    /// <summary>Less source text than this (about two lessons' worth) is "thin".</summary>
+    public const int ThinBelowChars = 3000;
+    /// <summary>This much source text or more (five lessons' worth) is "rich".</summary>
+    public const int RichFromChars = 7500;
+
+    public static string Coverage(int sourceChars) =>
+        sourceChars < ThinBelowChars ? "thin" : sourceChars >= RichFromChars ? "rich" : "adequate";
+
+    public static string CoverageNote(string coverage) => coverage switch
+    {
+        "thin" => "Limited material: fewer lessons and little to quiz on.",
+        "rich" => "Plenty of material to teach and quiz from.",
+        _ => "Enough material for a few lessons.",
+    };
 }
 
 public class LearnSession
@@ -199,7 +245,7 @@ public class ChatTurn
 public class AskResponse
 {
     public string Answer { get; set; } = "";
-    /// <summary>"notes", "general" or "none".</summary>
+    /// <summary>"notes", "general", "none" or "out_of_scope".</summary>
     public string Source { get; set; } = "";
     /// <summary>The badge text for this source (a fixed C# constant).</summary>
     public string Label { get; set; } = "";
@@ -233,6 +279,8 @@ public class AnswerResult
     public string? Insight { get; set; }
     public int OldLevel { get; set; }
     public int NewLevel { get; set; }
+    /// <summary>"Based on N questions": how much this result rests on.</summary>
+    public string Evidence { get; set; } = "";
     public List<QuestionFeedback> Questions { get; set; } = [];
     public List<TopicScore> TopicScores { get; set; } = [];   // checkpoints only
 }
@@ -259,6 +307,7 @@ public class TopicScore
     public int Total { get; set; }
     public int ScorePct { get; set; }
     public bool IsWeak { get; set; }
+    public string Evidence => Models.Evidence.BasedOn(Total);
 }
 
 public class HistoryResponse
@@ -286,6 +335,9 @@ public class TopicProgress
     public string Status { get; set; } = "";
     public int Level { get; set; }
     public int? LastCheckpointPct { get; set; }
+    public string? StatusEvidence { get; set; }
+    public string Coverage { get; set; } = "";
+    public string CoverageNote { get; set; } = "";
     public List<LevelChange> LevelChanges { get; set; } = [];
 }
 
@@ -295,4 +347,6 @@ public class LevelChange
     public int NewLevel { get; set; }
     public string Reason { get; set; } = "";
     public string At { get; set; } = "";
+    /// <summary>"Based on N questions", or null for changes recorded before this was stored.</summary>
+    public string? Evidence { get; set; }
 }

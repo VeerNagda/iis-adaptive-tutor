@@ -234,6 +234,13 @@ public static class Prompts
     // model must say "none" and the learner decides whether to ask for a
     // general-knowledge answer, which is then labelled as such.
     //
+    // Out of scope. Some requests are things the tutor cannot do at all (predict
+    // the exam, judge a grade, another course, show a picture). A model asked
+    // such a thing tends to answer anyway, and plausibly. So the model is only
+    // asked to CLASSIFY the request ("intent" and "out_of_scope_kind"); the reply
+    // the learner sees is a fixed C# template (Capability.OutOfScope) that says
+    // what the limit is and what to do instead.
+    //
     // Asking a question never changes the difficulty level: that is decided
     // only by quiz results.
     public const string GeneralAllowed = "GENERAL KNOWLEDGE: allowed";
@@ -259,8 +266,18 @@ public static class Prompts
             PASSAGES are taken from the learner's own uploaded notes. Each one starts with a
             header that names its file and pages.
 
+            First decide "intent". It is "out_of_scope" when the learner asks you to do one of
+            these things, which this tutor cannot do; set "out_of_scope_kind" to the name in brackets:
+              - predict exam questions or what will be on a test (exam_prediction)
+              - predict, estimate or judge their grade or mark (grades)
+              - help with a different course or subject than these notes (other_course)
+              - show, display or draw an image (show_image)
+            For "out_of_scope", set "source" to "none" and leave "answer" and "source_quote" empty.
+            Anything else is "in_scope" (leave "out_of_scope_kind" empty), including a question
+            the notes simply do not answer.
+
             {{(allowGeneral ? GeneralAllowed : GeneralNotAllowed)}}
-            How to answer the QUESTION:
+            How to answer an in_scope QUESTION:
             1. If PASSAGES answer it: set "source" to "notes" and answer using only facts found in
                PASSAGES. Copy into "source_quote" one sentence or phrase of at least 5 words, word
                for word with no changes, from the passage your answer rests on. Set "file_name" and
@@ -276,7 +293,7 @@ public static class Prompts
             {{StyleForLevel(level)}}
 
             Return JSON only, in exactly this shape:
-            {"source":"notes","source_quote":"...","file_name":"...","page":1,"answer":"..."}
+            {"intent":"in_scope","out_of_scope_kind":"","source":"notes","source_quote":"...","file_name":"...","page":1,"answer":"..."}
 
             <<<PASSAGES
             {{passages}}

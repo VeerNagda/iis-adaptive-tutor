@@ -24,7 +24,10 @@ type TopicProgress = {
   status: string;
   level: number;
   lastCheckpointPct: number | null;
-  levelChanges: { oldLevel: number; newLevel: number; reason: string; at: string }[];
+  statusEvidence: string | null; // how many questions the status rests on
+  coverage: string; // thin, adequate or rich: how much source text the topic has
+  coverageNote: string;
+  levelChanges: { oldLevel: number; newLevel: number; reason: string; at: string; evidence: string | null }[];
 };
 
 type History = { sessions: SessionHistory[]; topics: TopicProgress[] };
@@ -108,6 +111,10 @@ function HistoryContent() {
                           Last checkpoint: {t.lastCheckpointPct === null ? "none yet" : `${t.lastCheckpointPct}%`}
                         </span>
                       </div>
+                      <p className="mt-1 text-xs text-zinc-500">
+                        {t.statusEvidence ? `${t.statusEvidence}. ` : "No test taken yet. "}
+                        Material coverage: {t.coverage}. {t.coverageNote}
+                      </p>
                       {t.levelChanges.length > 0 && (
                         <ul className="mt-3 space-y-1 border-t border-zinc-100 pt-3 text-xs text-zinc-600">
                           {t.levelChanges.map((c, i) => (
@@ -118,6 +125,7 @@ function HistoryContent() {
                                 ({c.newLevel > c.oldLevel ? "harder" : "easier"})
                               </span>
                               : {c.reason}
+                              {c.evidence && <span className="text-zinc-400"> · {c.evidence}</span>}
                             </li>
                           ))}
                         </ul>

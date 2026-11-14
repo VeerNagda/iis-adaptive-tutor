@@ -130,6 +130,22 @@ public sealed class MockLlmProvider : ILlmProvider
         string realQuote = string.Join(" ", passage.Groups[3].Value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Take(12));
         string lower = question.ToLowerInvariant();
 
+        // Out-of-scope requests: a few keywords stand in for the real model's
+        // classification, so each fixed C# reply can be demonstrated.
+        // (\b = whole words only, so "example" does not count as "exam".)
+        string? kind =
+            Regex.IsMatch(lower, @"\bexams?\b") ? "exam_prediction" :
+            Regex.IsMatch(lower, @"\b(grades?|marks?)\b") ? "grades" :
+            Regex.IsMatch(lower, @"\b(other|another) (course|subject)\b") ? "other_course" :
+            Regex.IsMatch(lower, @"\bshow\b.*\b(image|picture)\b") ? "show_image" :
+            null;
+        if (kind is not null)
+            return JsonSerializer.Serialize(new
+            {
+                intent = "out_of_scope", out_of_scope_kind = kind,
+                source = "none", source_quote = "", file_name = "", page = 0, answer = "",
+            });
+
         if (lower.Contains(MockOutsideWord))
         {
             return prompt.Contains(Prompts.GeneralAllowed)

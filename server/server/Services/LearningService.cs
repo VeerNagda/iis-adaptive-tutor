@@ -146,7 +146,10 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             SELECT id, course_id, title, description, sequence_number, difficulty_level, status, chunk_ids,
                    -- total characters of the topic's source chunks (chunk_ids is a JSON array)
                    (SELECT COALESCE(SUM(LENGTH(c.text)), 0) FROM chunks c
-                    WHERE c.id IN (SELECT value FROM json_each(topics.chunk_ids)))
+                    WHERE c.id IN (SELECT value FROM json_each(topics.chunk_ids))),
+                   -- the topic's most recent test score: how many questions its status rests on
+                   (SELECT r.correct FROM checkpoint_results r WHERE r.topic_id = topics.id ORDER BY r.id DESC LIMIT 1),
+                   (SELECT r.total   FROM checkpoint_results r WHERE r.topic_id = topics.id ORDER BY r.id DESC LIMIT 1)
             FROM topics WHERE course_id = $c ORDER BY sequence_number
             """;
         cmd.Parameters.AddWithValue("$c", courseId);
@@ -166,6 +169,8 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 Status = r.GetString(6),
                 ChunkIds = r.IsDBNull(7) ? [] : JsonSerializer.Deserialize<List<int>>(r.GetString(7)) ?? [],
                 SourceLength = r.GetInt32(8),
+                LastTestCorrect = r.IsDBNull(9) ? null : r.GetInt32(9),
+                LastTestTotal = r.IsDBNull(10) ? null : r.GetInt32(10),
             });
         }
         return topics;
@@ -403,6 +408,15 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     private AskResponse LabelAnswer(
         SqliteConnection conn, int courseId, LlmAnswer reply, List<Passage> passages, bool allowGeneral)
     {
+        // Out of scope: the model's answer (if it wrote one) is thrown away and the
+        // fixed text for that kind of request is shown instead.
+        if (reply.Intent == "out_of_scope")
+        {
+            string template = Capability.OutOfScope(reply.OutOfScopeKind);
+            Capability.Log(conn, courseId, Capability.OutOfScopeRequest, template, reply.OutOfScopeKind);
+            return new AskResponse { Answer = template, Source = "out_of_scope", Label = Capability.OutsideTutor };
+        }
+
         string answer = reply.Answer?.Trim() ?? "";
         bool claimsNotes = reply.Source == "notes" && answer.Length > 0;
         var found = claimsNotes ? passages.FirstOrDefault(p => QuoteFound(p.Text, reply.SourceQuote)) : null;
@@ -563,6 +577,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             Simulated = request.SimulateWrong,
             OldLevel = topic?.DifficultyLevel ?? 0,
             NewLevel = topic?.DifficultyLevel ?? 0,
+            Evidence = Evidence.BasedOn(questions.Count),
         };
         for (int i = 0; i < questions.Count; i++)
         {
@@ -630,14 +645,14 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 """, ("$q", quizId)) as string;
 
             if (mistakes == 0)
-                ChangeLevel(conn, topic, session.Id, +1, "Passed a lesson quiz with no mistakes");
+                ChangeLevel(conn, topic, session.Id, +1, "Passed a lesson quiz with no mistakes", result.Total);
             session.Reason = null;
             AdvanceStep(session, topic);   // may set the reason for a checkpoint test
             result.Decision = session.Phase == "checkpoint" ? "checkpoint" : "advance";
         }
         else
         {
-            ChangeLevel(conn, topic, session.Id, -1, $"Failed a lesson quiz ({result.Correct}/{result.Total})");
+            ChangeLevel(conn, topic, session.Id, -1, $"Failed a lesson quiz ({result.Correct}/{result.Total})", result.Total);
             session.Attempt++;
             session.Phase = "lesson";
             session.Reason = $"Re-explained at an easier level ({topic.DifficultyLevel} of 5: "
@@ -651,9 +666,10 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     /// <summary>
     /// Raises or lowers a topic's difficulty level, kept within 1..5. The level
     /// is stored on the topic (so the next session starts from it) and every
-    /// change is written to difficulty_history with its reason.
+    /// change is written to difficulty_history with its reason and the number of
+    /// questions it was based on (so the History page can show how thin the evidence was).
     /// </summary>
-    private static void ChangeLevel(SqliteConnection conn, Topic topic, int sessionId, int delta, string reason)
+    private static void ChangeLevel(SqliteConnection conn, Topic topic, int sessionId, int delta, string reason, int questions)
     {
         int oldLevel = topic.DifficultyLevel;
         int newLevel = Math.Clamp(oldLevel + delta, 1, 5);
@@ -662,10 +678,10 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         topic.DifficultyLevel = newLevel;
         Exec(conn, "UPDATE topics SET difficulty_level = $l WHERE id = $t", ("$l", newLevel), ("$t", topic.Id));
         Exec(conn, """
-            INSERT INTO difficulty_history (topic_id, session_id, old_level, new_level, reason)
-            VALUES ($t, $s, $old, $new, $reason)
+            INSERT INTO difficulty_history (topic_id, session_id, old_level, new_level, reason, question_count)
+            VALUES ($t, $s, $old, $new, $reason, $n)
             """,
-            ("$t", topic.Id), ("$s", sessionId), ("$old", oldLevel), ("$new", newLevel), ("$reason", reason));
+            ("$t", topic.Id), ("$s", sessionId), ("$old", oldLevel), ("$new", newLevel), ("$reason", reason), ("$n", questions));
     }
 
     /// <summary>
@@ -769,7 +785,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             if (score.IsWeak)
             {
                 Exec(conn, "UPDATE topics SET status = 'weak' WHERE id = $t", ("$t", scored.Id));
-                ChangeLevel(conn, scored, session.Id, -1, $"Scored {score.ScorePct}% in a checkpoint test (below {WeakBelowPct}%)");
+                ChangeLevel(conn, scored, session.Id, -1, $"Scored {score.ScorePct}% in a checkpoint test (below {WeakBelowPct}%)", score.Total);
             }
             if (scored.Id == topic.Id)
             {
@@ -818,7 +834,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
         }
         else
         {
-            ChangeLevel(conn, topic, session.Id, -1, $"Scored {score.ScorePct}% in a re-test (below {WeakBelowPct}%)");
+            ChangeLevel(conn, topic, session.Id, -1, $"Scored {score.ScorePct}% in a re-test (below {WeakBelowPct}%)", score.Total);
 
             if (session.ReviewRound >= MaxReviewRounds)
             {
@@ -1355,7 +1371,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
             {
                 reteach.Add(topic.Title);
                 ChangeLevel(conn, topic, session.Id, -1,
-                    $"Scored {score.ScorePct}% in a mandatory topic test (below {WeakBelowPct}%)");
+                    $"Scored {score.ScorePct}% in a mandatory topic test (below {WeakBelowPct}%)", score.Total);
             }
             // Below 60%: to be re-taught. Otherwise the topic is confirmed as completed.
             Exec(conn, "UPDATE topics SET status = $status, awaiting_test = 0 WHERE id = $t",
@@ -1437,11 +1453,14 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 Status = topic.Status,
                 Level = topic.DifficultyLevel,
                 LastCheckpointPct = lastPct is null ? null : Convert.ToInt32(lastPct),
+                StatusEvidence = topic.StatusEvidence,
+                Coverage = topic.Coverage,
+                CoverageNote = topic.CoverageNote,
             };
 
             using var cmd = conn.CreateCommand();
             cmd.CommandText = """
-                SELECT old_level, new_level, reason, created_at
+                SELECT old_level, new_level, reason, created_at, question_count
                 FROM difficulty_history WHERE topic_id = $t ORDER BY id
                 """;
             cmd.Parameters.AddWithValue("$t", topic.Id);
@@ -1453,6 +1472,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                     NewLevel = r.GetInt32(1),
                     Reason = r.GetString(2),
                     At = r.GetString(3),
+                    Evidence = r.IsDBNull(4) ? null : Evidence.BasedOn(r.GetInt32(4)),
                 });
 
             history.Topics.Add(progress);

@@ -30,6 +30,15 @@ type Topic = {
   summary: string | null;
   difficultyLevel: number; // 1 (easiest) .. 5 (hardest)
   status: "new" | "learning" | "completed" | "weak";
+  statusEvidence: string | null; // "Based on N questions in the last test (...)", null before any test
+  coverage: "thin" | "adequate" | "rich"; // how much source text the topic has
+  coverageNote: string;
+};
+
+const COVERAGE_STYLE: Record<Topic["coverage"], string> = {
+  thin: "bg-amber-50 text-amber-800",
+  adequate: "bg-zinc-100 text-zinc-600",
+  rich: "bg-green-50 text-green-700",
 };
 type TopicList = {
   mockMode: boolean;
@@ -471,8 +480,16 @@ function TopicsPanel({ courseId, onMockMode }: { courseId: string; onMockMode: (
                     {topic.summary && <p className="mt-1 text-sm leading-relaxed text-zinc-500">{topic.summary}</p>}
                     <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
                       <span className={`rounded-full px-2 py-0.5 font-medium ${status.cls}`}>{status.label}</span>
+                      {/* How much the status rests on: a few quiz questions are weak evidence. */}
+                      {topic.statusEvidence && <span className="text-zinc-400">{topic.statusEvidence}</span>}
                       <span className="text-zinc-400">Difficulty level {topic.difficultyLevel} / 5</span>
                     </div>
+                    <p className="mt-2 text-xs text-zinc-500">
+                      <span className={`mr-1.5 rounded-full px-2 py-0.5 font-medium ${COVERAGE_STYLE[topic.coverage] ?? COVERAGE_STYLE.adequate}`}>
+                        Material coverage: {topic.coverage}
+                      </span>
+                      {topic.coverageNote}
+                    </p>
                   </div>
                   <button
                     onClick={() => start(topic.id)}
