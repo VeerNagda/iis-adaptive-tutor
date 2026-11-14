@@ -64,7 +64,7 @@ public sealed class IngestionBackgroundService(
 
             try
             {
-                await ingestion.IngestAsync(docId.Value, ct);
+                await ingestion.IngestAsync(docId.Value, ct: ct);
             }
             catch (LlmException ex) when (ex.Message.Contains("RESOURCE_EXHAUSTED"))
             {

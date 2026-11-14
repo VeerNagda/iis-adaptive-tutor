@@ -208,6 +208,21 @@ CREATE TABLE IF NOT EXISTS checkpoint_results (
     FOREIGN KEY (topic_id)   REFERENCES topics(id)        ON DELETE CASCADE
 );
 
+-- 12. Evidence log: every time the tutor told the learner about a limit of what
+--     it can do, or the learner made a choice about it (scope popup, source label
+--     downgrade, slip, flagged question, level override, out-of-scope request).
+--     shown_message  the text the learner saw
+--     user_choice    what they chose, NULL when there was nothing to choose
+CREATE TABLE IF NOT EXISTS capability_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp     TEXT DEFAULT CURRENT_TIMESTAMP,
+    course_id     INTEGER NOT NULL,
+    event_type    TEXT NOT NULL,
+    shown_message TEXT NOT NULL,
+    user_choice   TEXT,
+    FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE
+);
+
 -- ── Indexes ──────────────────────────────────────────────────────────────────
 CREATE INDEX IF NOT EXISTS idx_documents_course       ON documents(course_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_document        ON chunks(document_id, chunk_index);
@@ -215,4 +230,5 @@ CREATE INDEX IF NOT EXISTS idx_sections_document      ON document_sections(docum
 CREATE INDEX IF NOT EXISTS idx_topics_course          ON topics(course_id, sequence_number);
 CREATE INDEX IF NOT EXISTS idx_learn_lessons_session  ON learn_lessons(session_id, kind, step_index, attempt);
 CREATE INDEX IF NOT EXISTS idx_learn_quizzes_session  ON learn_quizzes(session_id);
-CREATE INDEX IF NOT EXISTS idx_learn_questions_quiz   ON learn_questions(quiz_id)
+CREATE INDEX IF NOT EXISTS idx_learn_questions_quiz   ON learn_questions(quiz_id);
+CREATE INDEX IF NOT EXISTS idx_capability_events      ON capability_events(course_id, id)

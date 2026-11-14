@@ -9,8 +9,6 @@ namespace server.Controllers;
 [Route("courses/{courseId:int}/documents")]
 public class DocumentsController(IDbConnectionFactory db, IConfiguration config, IngestionService ingestion) : ControllerBase
 {
-    private static readonly HashSet<string> AllowedExtensions = [".pdf", ".pptx", ".docx"];
-
     [HttpGet]
     public IActionResult GetAll(int courseId)
     {
@@ -52,16 +50,22 @@ public class DocumentsController(IDbConnectionFactory db, IConfiguration config,
         if (file is null || file.Length == 0)
             return BadRequest("No file provided.");
 
-        var ext = Path.GetExtension(file.FileName).ToLowerInvariant();
-        if (!AllowedExtensions.Contains(ext))
-            return BadRequest($"File type '{ext}' is not allowed. Use PDF, PPTX, or DOCX.");
-
         using var conn = db.CreateConnection();
         using var existsCmd = conn.CreateCommand();
         existsCmd.CommandText = "SELECT COUNT(*) FROM courses WHERE id = $id;";
         existsCmd.Parameters.AddWithValue("$id", courseId);
         if ((long)(existsCmd.ExecuteScalar() ?? 0L) == 0)
             return NotFound("Course not found.");
+
+        // An unsupported file is refused with the reason and what to do instead
+        // (for example a standalone picture, a video or a ZIP file).
+        var ext = Path.GetExtension(file.FileName).ToLowerInvariant();
+        if (!Capability.AcceptedExtensions.Contains(ext))
+        {
+            var reason = Capability.RejectReason(ext);
+            Capability.Log(conn, courseId, Capability.UploadRejected, reason, file.FileName);
+            return BadRequest(reason);
+        }
 
         var uploadsRoot = config["Uploads:Path"] ?? Path.Combine(AppContext.BaseDirectory, "uploads");
         var courseDir = Path.Combine(uploadsRoot, courseId.ToString());
@@ -99,6 +103,38 @@ public class DocumentsController(IDbConnectionFactory db, IConfiguration config,
         });
     }
 
+    /// <summary>The document's processing status, or null if it does not exist in this course.</summary>
+    private string? Status(int courseId, int docId)
+    {
+        using var conn = db.CreateConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT processing_status FROM documents
+            WHERE id = $docId AND course_id = $courseId AND deleted_at IS NULL;
+            """;
+        cmd.Parameters.AddWithValue("$docId", docId);
+        cmd.Parameters.AddWithValue("$courseId", courseId);
+        return cmd.ExecuteScalar() as string;
+    }
+
+    /// <summary>
+    /// Scope check before ingestion: pages, words, estimated chunks and any
+    /// warnings (textbook-sized file, scan with no text). No LLM call.
+    /// </summary>
+    [HttpGet("{docId:int}/scope")]
+    public IActionResult Scope(int courseId, int docId)
+    {
+        if (Status(courseId, docId) is null) return NotFound("Document not found.");
+        try
+        {
+            return Ok(ingestion.CheckScope(docId));
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(502, $"The file could not be read: {ex.Message}");
+        }
+    }
+
     /// <summary>
     /// Ingests one uploaded document now (extract text, chunk, sections, embeddings).
     /// Ingestion is started by hand from the UI instead of a background poller, so
@@ -106,25 +142,50 @@ public class DocumentsController(IDbConnectionFactory db, IConfiguration config,
     /// ingested, its topics are added the next time the topics list is loaded.
     /// </summary>
     [HttpPost("{docId:int}/ingest")]
-    public async Task<IActionResult> Ingest(int courseId, int docId, CancellationToken ct)
+    public async Task<IActionResult> Ingest(int courseId, int docId, [FromBody] IngestRequest? request, CancellationToken ct)
     {
-        using (var conn = db.CreateConnection())
+        var status = Status(courseId, docId);
+        if (status is null) return NotFound("Document not found.");
+        if (status == "completed") return NoContent();   // nothing to do
+
+        // The scope check is enforced here, not only in the browser: a file with a
+        // warning is not ingested until the learner has said what to do with it.
+        int? fromPage = null, toPage = null;
+        try
         {
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = """
-                SELECT processing_status FROM documents
-                WHERE id = $docId AND course_id = $courseId AND deleted_at IS NULL;
-                """;
-            cmd.Parameters.AddWithValue("$docId", docId);
-            cmd.Parameters.AddWithValue("$courseId", courseId);
-            var status = cmd.ExecuteScalar() as string;
-            if (status is null) return NotFound("Document not found.");
-            if (status == "completed") return NoContent();   // nothing to do
+            var scope = ingestion.CheckScope(docId);
+            string? choiceText = request?.Choice switch
+            {
+                "range" => $"Ingest a page range ({request.FromPage}-{request.ToPage})",
+                "first" => $"Ingest first {request.ToPage} {scope.Unit}",
+                "continue" => "Continue anyway",
+                _ => null,
+            };
+            if (scope.Warnings.Count > 0 && choiceText is null)
+                return BadRequest("Please choose how much of this file to ingest.");
+
+            if (request?.Choice is "range" or "first")
+            {
+                fromPage = request.Choice == "first" ? 1 : request.FromPage;
+                toPage = request.ToPage;
+                if (fromPage is null || toPage is null || fromPage < 1 || toPage > scope.Pages || fromPage > toPage)
+                    return BadRequest($"Please pick {scope.Unit} between 1 and {scope.Pages}.");
+            }
+
+            if (scope.Warnings.Count > 0)
+            {
+                using var conn = db.CreateConnection();
+                Capability.Log(conn, courseId, Capability.ScopeWarning, string.Join(" ", scope.Warnings), choiceText);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return StatusCode(502, $"The file could not be read: {ex.Message}");
         }
 
         try
         {
-            await ingestion.IngestAsync(docId, ct);
+            await ingestion.IngestAsync(docId, fromPage, toPage, ct);
             return NoContent();
         }
         catch (Exception ex)

@@ -17,33 +17,34 @@ public static class TextExtractor
 {
     public sealed record PageText(int PageNumber, string Text, IReadOnlyList<LlmImage> Images);
 
-    public static IReadOnlyList<PageText> Extract(string filePath, string fileType) =>
+    /// <summary>
+    /// Every page of the file is returned, including pages with no text, so the
+    /// caller can count and report them. includeImages = false skips the (slow)
+    /// image extraction; the scope check before ingestion only needs the text.
+    /// </summary>
+    public static IReadOnlyList<PageText> Extract(string filePath, string fileType, bool includeImages = true) =>
         fileType.ToLowerInvariant() switch
         {
-            "pdf"  => ExtractPdf(filePath),
-            "docx" => ExtractDocx(filePath),
-            "pptx" => ExtractPptx(filePath),
+            "pdf"  => ExtractPdf(filePath, includeImages),
+            "docx" => ExtractDocx(filePath, includeImages),
+            "pptx" => ExtractPptx(filePath, includeImages),
             "txt"  => [new PageText(1, File.ReadAllText(filePath), [])],
             _      => throw new NotSupportedException($"Unsupported file type: {fileType}")
         };
-
-    /// <summary>A page is kept if it has text or at least one image (e.g. a scanned page).</summary>
-    private static bool HasContent(PageText p) => !string.IsNullOrWhiteSpace(p.Text) || p.Images.Count > 0;
 
     /// <summary>Image formats the LLM accepts. Others (EMF, WMF, GIF, ...) are skipped.</summary>
     private static bool IsSupported(string mimeType) => mimeType is "image/png" or "image/jpeg" or "image/webp";
 
     // ── PDF ───────────────────────────────────────────────────────────────────
 
-    private static IReadOnlyList<PageText> ExtractPdf(string path)
+    private static IReadOnlyList<PageText> ExtractPdf(string path, bool includeImages)
     {
         using var doc = PdfDocument.Open(path);
         return doc.GetPages()
                   .Select(p => new PageText(
                       p.Number,
                       string.Join(" ", p.GetWords().Select(w => w.Text)),
-                      PdfImages(p)))
-                  .Where(HasContent)
+                      includeImages ? PdfImages(p) : []))
                   .ToList();
     }
 
@@ -77,7 +78,7 @@ public static class TextExtractor
     // DOCX has no fixed page boundaries; we assign a "virtual page" every
     // 40 paragraphs so chunks can still carry meaningful page_start/page_end numbers.
 
-    private static IReadOnlyList<PageText> ExtractDocx(string path)
+    private static IReadOnlyList<PageText> ExtractDocx(string path, bool includeImages)
     {
         using var doc = WordprocessingDocument.Open(path, false);
         var main = doc.MainDocumentPart;
@@ -94,7 +95,7 @@ public static class TextExtractor
         {
             // A picture sits inside a paragraph as a "blip" that points (by id) at
             // the image file stored in the document.
-            foreach (var blip in para.Descendants<A.Blip>())
+            foreach (var blip in includeImages ? para.Descendants<A.Blip>() : [])
                 if (blip.Embed?.Value is { } id && main!.GetPartById(id) is ImagePart part && IsSupported(part.ContentType))
                     images.Add(ReadImage(part));
 
@@ -122,7 +123,7 @@ public static class TextExtractor
     // ── PPTX ──────────────────────────────────────────────────────────────────
     // Each slide maps to one "page".
 
-    private static IReadOnlyList<PageText> ExtractPptx(string path)
+    private static IReadOnlyList<PageText> ExtractPptx(string path, bool includeImages)
     {
         using var doc = PresentationDocument.Open(path, false);
         var parts = doc.PresentationPart?.SlideParts?.ToList()
@@ -137,10 +138,11 @@ public static class TextExtractor
                                .Select(t => t.Text)
                                .Where(t => !string.IsNullOrWhiteSpace(t)));
                 // The picture files used on this slide.
-                var images = slide.ImageParts.Where(p => IsSupported(p.ContentType)).Select(ReadImage).ToList();
+                List<LlmImage> images = includeImages
+                    ? slide.ImageParts.Where(p => IsSupported(p.ContentType)).Select(ReadImage).ToList()
+                    : [];
                 return new PageText(i + 1, text, images);
             })
-            .Where(HasContent)
             .ToList();
     }
 

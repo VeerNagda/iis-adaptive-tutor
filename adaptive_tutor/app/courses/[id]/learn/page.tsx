@@ -26,6 +26,21 @@ type TopicList = {
   topics: Topic[];
 };
 
+// What a file contains, checked before ingestion (no LLM call). warnings is
+// empty when the file is the kind of material the tutor handles well.
+type Scope = {
+  unit: string; // "pages" or "slides"
+  pages: number;
+  pagesWithoutText: number;
+  words: number;
+  estimatedChunks: number;
+  suggestedFirstPages: number;
+  warnings: string[];
+};
+// How much of the file to ingest (the learner's answer to a scope warning).
+type IngestChoice = { choice: "range" | "first" | "continue"; fromPage?: number; toPage?: number };
+type Capabilities = { can: string[]; cannot: string[] };
+
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5242";
 
 const DOC_STATUS: Record<string, { label: string; cls: string }> = {
@@ -42,6 +57,98 @@ const TOPIC_STATUS: Record<Topic["status"], { label: string; cls: string; action
   weak: { label: "Needs re-teaching", cls: "bg-amber-100 text-amber-800", action: "Re-learn" },
 };
 
+// ─── Scope popup: shown before ingesting a file the tutor may handle badly ───
+// The server decides when to warn and writes the message; the learner decides
+// what to do. Nothing is ingested until one of the choices is picked.
+
+function ScopePopup({
+  filename, scope, onChoose, onCancel,
+}: {
+  filename: string;
+  scope: Scope;
+  onChoose: (choice: IngestChoice) => void;
+  onCancel: () => void;
+}) {
+  const [from, setFrom] = useState(1);
+  const [to, setTo] = useState(scope.suggestedFirstPages);
+  const [firstN, setFirstN] = useState(scope.suggestedFirstPages);
+  const rangeOk = from >= 1 && to <= scope.pages && from <= to;
+  const firstOk = firstN >= 1 && firstN <= scope.pages;
+  const numberInput = "w-16 rounded border border-zinc-300 px-2 py-1 text-sm text-zinc-900";
+  const choiceButton = "rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50";
+
+  return (
+    <div className="fixed inset-0 z-10 flex items-center justify-center bg-black/40 px-4" role="dialog" aria-modal="true" aria-labelledby="scope-title">
+      <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-xl">
+        <h3 id="scope-title" className="text-base font-semibold text-zinc-900">Before we ingest this file</h3>
+        <p className="mt-0.5 truncate text-xs text-zinc-500" title={filename}>{filename}</p>
+
+        {scope.warnings.map((w, i) => (
+          <p key={i} className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">{w}</p>
+        ))}
+        <p className="mt-3 text-xs text-zinc-500">
+          {scope.pages} {scope.unit} · about {scope.words.toLocaleString()} words · about {scope.estimatedChunks} chunks
+          {scope.pagesWithoutText > 0 && ` · ${scope.pagesWithoutText} ${scope.unit} with no text`}
+        </p>
+
+        <div className="mt-4 space-y-3">
+          <div className="flex flex-wrap items-center gap-2 text-sm text-zinc-700">
+            <span>From</span>
+            <input type="number" min={1} max={scope.pages} value={from} onChange={(e) => setFrom(Number(e.target.value))} className={numberInput} aria-label="First page of the range" />
+            <span>to</span>
+            <input type="number" min={1} max={scope.pages} value={to} onChange={(e) => setTo(Number(e.target.value))} className={numberInput} aria-label="Last page of the range" />
+            <button onClick={() => onChoose({ choice: "range", fromPage: from, toPage: to })} disabled={!rangeOk} className={choiceButton}>
+              Ingest a page range
+            </button>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-sm text-zinc-700">
+            <span>First</span>
+            <input type="number" min={1} max={scope.pages} value={firstN} onChange={(e) => setFirstN(Number(e.target.value))} className={numberInput} aria-label="Number of pages from the start" />
+            <span>{scope.unit}</span>
+            <button onClick={() => onChoose({ choice: "first", toPage: firstN })} disabled={!firstOk} className={choiceButton}>
+              Ingest first {firstOk ? firstN : "N"} {scope.unit}
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-5 flex justify-end gap-2 border-t border-zinc-100 pt-4">
+          <button onClick={() => onChoose({ choice: "continue" })} className={choiceButton}>Continue anyway</button>
+          <button onClick={onCancel} className="rounded-lg bg-zinc-900 px-4 py-1.5 text-xs font-medium text-white hover:bg-zinc-700">
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Permanent card: what the tutor can and cannot do ────────────────────────
+// Always visible on the course page, so expectations are set before the
+// learner starts, not only after something goes wrong.
+
+function CapabilityCard() {
+  const [caps, setCaps] = useState<Capabilities | null>(null);
+
+  useEffect(() => {
+    apiService.get<Capabilities>("/capabilities").then(setCaps).catch(() => {});
+  }, []);
+
+  if (!caps) return null;
+  return (
+    <section className="rounded-2xl border border-zinc-200 bg-white p-6">
+      <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">What this tutor can and can&apos;t do</h2>
+      <p className="mb-1 text-xs font-semibold text-green-700">It can</p>
+      <ul className="mb-3 list-disc space-y-1 pl-4 text-xs leading-relaxed text-zinc-600">
+        {caps.can.map((line) => <li key={line}>{line}</li>)}
+      </ul>
+      <p className="mb-1 text-xs font-semibold text-amber-700">Its limits</p>
+      <ul className="list-disc space-y-1 pl-4 text-xs leading-relaxed text-zinc-600">
+        {caps.cannot.map((line) => <li key={line}>{line}</li>)}
+      </ul>
+    </section>
+  );
+}
+
 // ─── Materials: the uploaded files the topics are extracted from ─────────────
 
 function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested: () => void }) {
@@ -49,6 +156,8 @@ function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested
   const [uploading, setUploading] = useState(false);
   const [ingestingId, setIngestingId] = useState<number | null>(null);
   const [error, setError] = useState("");
+  // Set while the scope popup is open for a file.
+  const [scopeCheck, setScopeCheck] = useState<{ doc: Document; scope: Scope } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const fetchDocs = useCallback(
@@ -72,7 +181,8 @@ function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested
       const form = new FormData();
       form.append("file", file);
       const res = await fetch(`${BASE}/courses/${courseId}/documents`, { method: "POST", body: form });
-      if (!res.ok) setError(`Failed to upload ${file.name}`);
+      // The server says why a file was refused and what to do instead.
+      if (!res.ok) setError(`${file.name}: ${(await res.text()) || "upload failed."}`);
     }
     await fetchDocs();
     setUploading(false);
@@ -81,17 +191,57 @@ function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested
 
   // Ingestion is started by hand (it uses the LLM). When it succeeds, the topic
   // list is reloaded so the new file's topics appear.
-  async function handleIngest(docId: number) {
+  async function ingest(docId: number, choice: IngestChoice | Record<string, never>) {
     setIngestingId(docId);
     setError("");
     try {
-      await apiService.post(`/courses/${courseId}/documents/${docId}/ingest`, {});
+      await apiService.post(`/courses/${courseId}/documents/${docId}/ingest`, choice);
       onIngested();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ingestion failed.");
     }
     await fetchDocs();
     setIngestingId(null);
+  }
+
+  // "Ingest" first asks the server what the file contains. A file with a
+  // warning opens the popup; any other file is ingested straight away.
+  async function handleIngest(doc: Document) {
+    setIngestingId(doc.id);
+    setError("");
+    try {
+      const scope = await apiService.get<Scope>(`/courses/${courseId}/documents/${doc.id}/scope`);
+      if (scope.warnings.length > 0) {
+        setScopeCheck({ doc, scope });
+        setIngestingId(null);
+        return;
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "The file could not be checked.");
+      setIngestingId(null);
+      return;
+    }
+    await ingest(doc.id, {});
+  }
+
+  function chooseScope(choice: IngestChoice) {
+    if (!scopeCheck) return;
+    const docId = scopeCheck.doc.id;
+    setScopeCheck(null);
+    ingest(docId, choice); // the server records the warning together with this choice
+  }
+
+  function cancelScope() {
+    if (!scopeCheck) return;
+    // "Cancel" never reaches the ingest endpoint, so it is recorded separately.
+    apiService
+      .post(`/courses/${courseId}/events`, {
+        eventType: "scope_warning",
+        shownMessage: scopeCheck.scope.warnings.join(" "),
+        userChoice: "Cancel",
+      })
+      .catch(() => {});
+    setScopeCheck(null);
   }
 
   async function handleRemove(docId: number) {
@@ -118,7 +268,6 @@ function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested
           ref={fileInputRef}
           type="file"
           multiple
-          accept=".pdf,.pptx,.docx"
           className="hidden"
           onChange={(e) => handleFiles(e.target.files)}
         />
@@ -145,7 +294,7 @@ function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested
                 </div>
                 {doc.processingStatus !== "completed" && (
                   <button
-                    onClick={() => handleIngest(doc.id)}
+                    onClick={() => handleIngest(doc)}
                     disabled={ingestingId !== null}
                     className="shrink-0 rounded border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
                   >
@@ -162,6 +311,15 @@ function MaterialsPanel({ courseId, onIngested }: { courseId: string; onIngested
             );
           })}
         </ul>
+      )}
+
+      {scopeCheck && (
+        <ScopePopup
+          filename={scopeCheck.doc.filename}
+          scope={scopeCheck.scope}
+          onChoose={chooseScope}
+          onCancel={cancelScope}
+        />
       )}
     </section>
   );
@@ -351,8 +509,9 @@ function LearnContent() {
         <div className="lg:col-span-2">
           <TopicsPanel key={topicsVersion} courseId={id} onMockMode={setMockMode} />
         </div>
-        <div>
+        <div className="space-y-6">
           <MaterialsPanel courseId={id} onIngested={() => setTopicsVersion((v) => v + 1)} />
+          <CapabilityCard />
         </div>
       </main>
     </div>

@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using server.Data;
 using server.LLM;
+using server.Models;
 
 namespace server.Services;
 
@@ -28,7 +29,70 @@ public sealed class IngestionService(
 {
     // ── Public API ─────────────────────────────────────────────────────────────
 
-    public async Task IngestAsync(int documentId, CancellationToken ct = default)
+    // ── Scope check: is this the kind of file the tutor handles well? ─────────
+    //
+    // Run before ingestion, with no LLM call. The tutor is built for lecture
+    // notes and slides. A whole textbook, or a scan with no real text, would be
+    // accepted silently and then taught badly, so the learner is told first and
+    // chooses what to do. The limits are the plain constants below.
+
+    /// <summary>More pages (or slides) than this looks like a textbook, not a lecture.</summary>
+    public const int WarnAbovePages = 50;
+    /// <summary>More words than this looks like a textbook, not a lecture.</summary>
+    public const int WarnAboveWords = 25_000;
+    /// <summary>Warn when more than this share of the pages has no readable text (a scan).</summary>
+    public const double WarnNoTextShare = 0.30;
+    /// <summary>A page with fewer words than this counts as having no text.</summary>
+    public const int NoTextBelowWords = 5;
+    /// <summary>Default for "Ingest first N pages": roughly one lecture.</summary>
+    public const int SuggestedFirstPages = 30;
+    /// <summary>Words per chunk (also used to estimate the number of chunks).</summary>
+    public const int ChunkTargetWords = 400;
+
+    /// <summary>Counts pages and words of an uploaded file and lists any warnings.</summary>
+    public ScopeReport CheckScope(int documentId)
+    {
+        var (filePath, fileType, _) = GetDocument(documentId);
+        if (!File.Exists(filePath))
+            throw new FileNotFoundException($"File not on disk: {filePath}");
+
+        var pages = TextExtractor.Extract(filePath, fileType, includeImages: false);
+        var wordsPerPage = pages.Select(p => WordCount(p.Text)).ToList();
+
+        var scope = new ScopeReport
+        {
+            Unit = fileType == "pptx" ? "slides" : "pages",
+            Pages = pages.Count,
+            PagesWithoutText = wordsPerPage.Count(w => w < NoTextBelowWords),
+            Words = wordsPerPage.Sum(),
+            SuggestedFirstPages = Math.Min(SuggestedFirstPages, pages.Count),
+        };
+        scope.EstimatedChunks = (int)Math.Ceiling(scope.Words / (double)ChunkTargetWords);
+
+        if (scope.Pages > WarnAbovePages || scope.Words > WarnAboveWords)
+            scope.Warnings.Add(
+                $"This looks like a textbook ({scope.Pages} {scope.Unit}, about {scope.Words:N0} words). "
+                + "The tutor works best with lecture notes or slides. "
+                + "Pick a chapter range, or upload your lecture material instead.");
+
+        if (scope.Pages > 0 && scope.PagesWithoutText > scope.Pages * WarnNoTextShare)
+            scope.Warnings.Add(
+                $"{scope.PagesWithoutText} of {scope.Pages} {scope.Unit} have no text the tutor can read, "
+                + "so this may be a scan or mostly pictures. "
+                + $"The tutor can describe at most {MaxImagesPerDocument} pictures per file in words, so a lot may be missed. "
+                + "A version with real text will work much better.");
+
+        return scope;
+    }
+
+    private static int WordCount(string text) =>
+        text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
+
+    /// <summary>
+    /// Ingests a document. fromPage and toPage (1-based, inclusive) limit it to a
+    /// page range chosen by the learner; null means the whole file.
+    /// </summary>
+    public async Task IngestAsync(int documentId, int? fromPage = null, int? toPage = null, CancellationToken ct = default)
     {
         log.LogInformation("Ingesting document {Id}", documentId);
         SetStatus(documentId, "processing");
@@ -40,8 +104,10 @@ public sealed class IngestionService(
             if (!File.Exists(filePath))
                 throw new FileNotFoundException($"File not on disk: {filePath}");
 
-            // Step 1 – extract text and images
-            var extracted = TextExtractor.Extract(filePath, fileType);
+            // Step 1 – extract text and images, keeping only the chosen page range
+            var extracted = TextExtractor.Extract(filePath, fileType)
+                .Where(p => p.PageNumber >= (fromPage ?? 1) && p.PageNumber <= (toPage ?? int.MaxValue))
+                .ToList();
 
             // Step 1b – the LLM describes the images; the descriptions join the page text
             var pages = await DescribeImagesAsync(extracted, ct);
@@ -49,7 +115,7 @@ public sealed class IngestionService(
                 throw new InvalidOperationException("No text or usable images could be extracted from the file.");
 
             // Step 2 – chunk
-            var chunks = SplitIntoChunks(pages, targetWords: 400);
+            var chunks = SplitIntoChunks(pages, ChunkTargetWords);
             log.LogInformation("{Count} chunks from {Pages} pages", chunks.Count, pages.Count);
 
             // Step 3 – generate sections

@@ -1,18 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { apiService } from "../../services/apiService";
 
 type UploadedFile = { id: string; file: File };
 type SubmitState = "idle" | "submitting" | "error";
+type Capabilities = { acceptedExtensions: string[]; rejectReasons: Record<string, string>; otherFileReason: string };
 
-const ACCEPTED_TYPES = [
-  "application/pdf",
-  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-];
 const ACCEPTED_EXTENSIONS = ".pdf,.pptx,.docx";
 const EXT_LABEL: Record<string, string> = {
   "application/pdf": "PDF",
@@ -41,11 +37,26 @@ export default function CreateCoursePage() {
   const [errorMsg, setErrorMsg] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Which files the tutor accepts and why it refuses the others. The wording
+  // comes from the server so it is the same here and on the course page.
+  const [caps, setCaps] = useState<Capabilities | null>(null);
+  useEffect(() => {
+    apiService.get<Capabilities>("/capabilities").then(setCaps).catch(() => {});
+  }, []);
+
   function addFiles(incoming: FileList | null) {
     if (!incoming) return;
-    const valid = Array.from(incoming).filter((f) => ACCEPTED_TYPES.includes(f.type));
-    if (valid.length < incoming.length)
-      setErrorMsg("Some files were skipped — only PDF, PPTX, and DOCX are accepted.");
+    const extension = (f: File) => f.name.slice(f.name.lastIndexOf(".")).toLowerCase();
+    const accepted = caps?.acceptedExtensions ?? ACCEPTED_EXTENSIONS.split(",");
+    const all = Array.from(incoming);
+    const valid = all.filter((f) => accepted.includes(extension(f)));
+    const skipped = all.filter((f) => !valid.includes(f));
+    if (skipped.length > 0)
+      setErrorMsg(
+        skipped
+          .map((f) => `${f.name}: ${caps?.rejectReasons[extension(f)] ?? caps?.otherFileReason ?? "Only PDF, PPTX and DOCX are accepted."}`)
+          .join(" ")
+      );
     setFiles((prev) => [
       ...prev,
       ...valid
@@ -172,7 +183,6 @@ export default function CreateCoursePage() {
                 ref={fileInputRef}
                 type="file"
                 multiple
-                accept={ACCEPTED_EXTENSIONS}
                 className="hidden"
                 onChange={(e) => addFiles(e.target.files)}
               />

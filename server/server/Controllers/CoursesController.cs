@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using server.Data;
 using server.Models;
+using server.Services;
 
 namespace server.Controllers;
 
@@ -49,6 +50,33 @@ public class CoursesController(IDbConnectionFactory db) : ControllerBase
             Description = reader.IsDBNull(2) ? null : reader.GetString(2),
             CreatedAt = reader.GetString(3),
         });
+    }
+
+    /// <summary>
+    /// What the tutor can and cannot do, and which files it accepts. The text comes
+    /// from the constants in <see cref="Capability"/> so every page shows the same words.
+    /// </summary>
+    [HttpGet("/capabilities")]
+    public IActionResult Capabilities() => Ok(new
+    {
+        can = Capability.Can,
+        cannot = Capability.Cannot,
+        acceptedExtensions = Capability.AcceptedExtensions,
+        rejectReasons = Capability.RejectReasons,
+        otherFileReason = Capability.OtherFileReason,
+    });
+
+    /// <summary>
+    /// Lets the browser record a choice the server would otherwise never see
+    /// (for example "Cancel" on the scope popup). Only listed event types are accepted.
+    /// </summary>
+    [HttpPost("{id:int}/events")]
+    public IActionResult LogEvent(int id, [FromBody] ClientEvent e)
+    {
+        if (!Capability.ClientEvents.Contains(e.EventType)) return BadRequest("Unknown event type.");
+        using var conn = db.CreateConnection();
+        Capability.Log(conn, id, e.EventType, e.ShownMessage, e.UserChoice);
+        return NoContent();
     }
 
     [HttpPost]
