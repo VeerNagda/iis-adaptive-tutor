@@ -222,7 +222,18 @@ function LessonChat({ askUrl, disabled, saved }: { askUrl: string; disabled: boo
       )}
 
       {asking && <p className="mt-3 text-xs text-zinc-500">The tutor is writing an answer…</p>}
-      {error && <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600">{error}</p>}
+      {error && (
+        <div className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600">
+          <p>{error}</p>
+          <button
+            onClick={() => send(draft.trim(), false)}
+            disabled={asking || !draft.trim()}
+            className="mt-1.5 rounded border border-red-300 px-2 py-0.5 font-medium hover:bg-red-100 disabled:opacity-50"
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       <form onSubmit={ask} className="mt-3 flex gap-2">
         <input

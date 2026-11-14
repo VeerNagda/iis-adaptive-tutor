@@ -350,6 +350,7 @@ public class TopicScore
 
 public class HistoryResponse
 {
+    public bool MockMode { get; set; }
     // "What the tutor has stored about you": everything the adaptation uses.
     public bool AdaptationPaused { get; set; }
     public int Slips { get; set; }

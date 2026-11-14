@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useState } from "react";
+import { MockBadge } from "../../../components/MockBadge";
 import { apiService } from "../../../services/apiService";
 
 // ─── Types (match the backend's Models/Learning.cs) ──────────────────────────
@@ -32,6 +33,7 @@ type TopicProgress = {
 };
 
 type History = {
+  mockMode: boolean;
   // "What the tutor has stored about you"
   adaptationPaused: boolean;
   slips: number;
@@ -107,7 +109,8 @@ function HistoryContent() {
         <div className="mx-auto flex max-w-5xl items-center gap-4">
           <Link href={`/courses/${courseId}/learn`} className="text-sm text-zinc-500 hover:text-zinc-800">← Topics</Link>
           <span className="text-zinc-300">/</span>
-          <h1 className="text-sm font-semibold text-zinc-900">History</h1>
+          <h1 className="flex-1 text-sm font-semibold text-zinc-900">History</h1>
+          {history?.mockMode && <MockBadge />}
         </div>
       </header>
 

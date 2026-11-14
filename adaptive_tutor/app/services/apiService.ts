@@ -26,8 +26,9 @@ async function request<T>(endpoint: string, options: RequestOptions = {}): Promi
   const response = await fetch(`${BASE_URL}${endpoint}`, config);
 
   if (!response.ok) {
+    // The server writes its error messages for the learner, so they are shown as they are.
     const errorText = await response.text();
-    throw new Error(`HTTP ${response.status}: ${errorText}`);
+    throw new Error(errorText || `The request failed (HTTP ${response.status}).`);
   }
 
   // Handle empty responses (e.g. 204 No Content)

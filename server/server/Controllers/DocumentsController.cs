@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
 using server.Data;
+using server.LLM;
 using server.Models;
 using server.Services;
 
@@ -223,9 +224,8 @@ public class DocumentsController(IDbConnectionFactory db, IConfiguration config,
         }
         catch (Exception ex)
         {
-            // IngestAsync has already stored the failure on the document row.
-            var message = ex.Message.Length > 300 ? ex.Message[..300] + "…" : ex.Message;
-            return StatusCode(502, $"Ingestion failed: {message}");
+            // IngestAsync has already stored the failure (in plain words) on the document row.
+            return StatusCode(502, $"Ingestion failed. {LlmFailure.Explain(ex)}");
         }
     }
 

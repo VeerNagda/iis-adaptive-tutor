@@ -157,9 +157,11 @@ public sealed class IngestionService(
         catch (Exception ex)
         {
             log.LogError(ex, "Ingestion failed for document {Id}", documentId);
-            report.Failure = $"It stopped while {step}: {ex.Message}";
+            // Stored in plain words (LlmFailure.Explain); the raw error is in the log above.
+            string why = LlmFailure.Explain(ex);
+            report.Failure = $"It stopped while {step}: {why}";
             SaveReport(documentId, report);
-            SetStatus(documentId, "failed", ex.Message);
+            SetStatus(documentId, "failed", why);
             throw;
         }
     }

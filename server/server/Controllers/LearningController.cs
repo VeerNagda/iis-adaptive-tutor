@@ -100,13 +100,19 @@ public class LearningController(LearningService learning) : ControllerBase
 
     /// <summary>Past sessions and per-topic progress and difficulty.</summary>
     [HttpGet("history")]
-    public IActionResult GetHistory(int courseId) => Ok(learning.GetHistory(courseId));
+    public IActionResult GetHistory(int courseId)
+    {
+        var history = learning.GetHistory(courseId);
+        history.MockMode = learning.MockMode;   // so the History page shows the MOCK MODE badge too
+        return Ok(history);
+    }
 
     private Task<IActionResult> Done() => Task.FromResult<IActionResult>(NoContent());
 
     /// <summary>
-    /// Runs an action and maps LLM failures to 502 with a readable message,
-    /// so the frontend can show it next to a "Retry" button.
+    /// Runs an action and maps LLM failures to 502 with a plain message
+    /// (LlmFailure.Explain), so the frontend can show it next to a "Retry" button.
+    /// A failed call is reported as failed; nothing falls back to mock content.
     /// </summary>
     private async Task<IActionResult> Run(Func<Task<IActionResult>> action)
     {
@@ -116,15 +122,17 @@ public class LearningController(LearningService learning) : ControllerBase
         }
         catch (LlmException ex)
         {
-            return StatusCode(502, ex.Message);
+            return StatusCode(502, LlmFailure.Explain(ex));
         }
         catch (LearningException ex)
         {
             return BadRequest(ex.Message);
         }
-        catch (HttpRequestException)
+        catch (Exception ex) when (ex is HttpRequestException
+            || (ex is OperationCanceledException && !HttpContext.RequestAborted.IsCancellationRequested))
         {
-            return StatusCode(502, "Could not reach the AI service. Check your connection and retry.");
+            // Network failure, or the AI service timed out (not the browser leaving).
+            return StatusCode(502, LlmFailure.Explain(ex));
         }
     }
 }
