@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 using server.Data;
 using server.LLM;
@@ -142,7 +143,10 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
     {
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, course_id, title, description, sequence_number, difficulty_level, status, chunk_ids
+            SELECT id, course_id, title, description, sequence_number, difficulty_level, status, chunk_ids,
+                   -- total characters of the topic's source chunks (chunk_ids is a JSON array)
+                   (SELECT COALESCE(SUM(LENGTH(c.text)), 0) FROM chunks c
+                    WHERE c.id IN (SELECT value FROM json_each(topics.chunk_ids)))
             FROM topics WHERE course_id = $c ORDER BY sequence_number
             """;
         cmd.Parameters.AddWithValue("$c", courseId);
@@ -161,6 +165,7 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
                 DifficultyLevel = r.GetInt32(5),
                 Status = r.GetString(6),
                 ChunkIds = r.IsDBNull(7) ? [] : JsonSerializer.Deserialize<List<int>>(r.GetString(7)) ?? [],
+                SourceLength = r.GetInt32(8),
             });
         }
         return topics;
@@ -868,23 +873,49 @@ public sealed class LearningService(IDbConnectionFactory db, ILlmProvider llm, I
 
     // ── Source text for a lesson step ─────────────────────────────────────────
 
-    private static int TotalSteps(Topic topic) => Math.Clamp(topic.ChunkIds.Count, 1, MaxSteps);
+    /// <summary>
+    /// Source text behind one lesson, in characters (about 240 words). A lesson is
+    /// only about 150 words long, so it cannot cover a whole 400-word chunk; the
+    /// number of lessons therefore follows the amount of text, not the chunk count.
+    /// </summary>
+    private const int SourceCharsPerLesson = 1500;
+
+    /// <summary>Lessons in a topic: one per 1500 characters of source, between 1 and MaxSteps.</summary>
+    private static int TotalSteps(Topic topic) =>
+        Math.Clamp((int)Math.Ceiling(topic.SourceLength / (double)SourceCharsPerLesson), 1, MaxSteps);
 
     /// <summary>
     /// The uploaded text that lesson steps fromStep..toStep are grounded in (one
-    /// step for a lesson, several for a checkpoint or review). The topic's chunks
-    /// are spread evenly over its steps (chunk i belongs to step i * steps / count).
+    /// step for a lesson, several for a checkpoint or review). The topic's text
+    /// (all its chunks, in order) is cut into sentences and the sentences are
+    /// spread evenly over the steps, so every step gets a similar amount of text
+    /// and no sentence is cut in half.
     /// </summary>
     private static string StepsSource(SqliteConnection conn, Topic topic, int fromStep, int toStep)
     {
         int steps = TotalSteps(topic);
-        var texts = topic.ChunkIds
-            .Where((_, i) => i * steps / topic.ChunkIds.Count >= fromStep
-                          && i * steps / topic.ChunkIds.Count <= toStep)
+        var full = string.Join("\n\n", topic.ChunkIds
             .Select(id => Scalar(conn, "SELECT text FROM chunks WHERE id = $id", ("$id", id)) as string)
-            .Where(t => !string.IsNullOrWhiteSpace(t));
+            .Where(t => !string.IsNullOrWhiteSpace(t)));
 
-        var source = string.Join("\n\n", texts);
+        // A sentence ends at . ! or ? followed by a space (a closing ] ends an image
+        // description). Text with no punctuation, such as a slide's bullet points,
+        // is cut every 60 words instead so that it can still be spread over steps.
+        var pieces = Regex.Split(full, @"(?<=[.!?\]])\s+")
+            .SelectMany(sentence => sentence.Split(' ', StringSplitOptions.RemoveEmptyEntries).Chunk(60))
+            .Select(words => string.Join(" ", words));
+
+        // A piece belongs to the step that its starting position falls in.
+        var selected = new List<string>();
+        int position = 0;
+        foreach (var piece in pieces)
+        {
+            int step = Math.Min((int)((long)position * steps / Math.Max(full.Length, 1)), steps - 1);
+            if (step >= fromStep && step <= toStep) selected.Add(piece);
+            position += piece.Length + 1;
+        }
+
+        var source = string.Join(" ", selected);
         if (source.Length == 0)
             throw new LearningException("The source text for this lesson is missing. Was the document removed?");
 

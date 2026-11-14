@@ -29,7 +29,7 @@ The LLM only writes content (topics, lessons, questions) as JSON. Scoring, pass 
 - Loading the topics list extracts topics (title + summary) from the sections of documents not yet processed (`documents.topics_extracted = 0`) and appends them. Existing topics and progress are never touched.
 
 ### Lesson loop (one session = one topic)
-A topic's source chunks are spread over at most 6 lesson steps. Per step:
+A topic has one lesson step per 1500 characters (about 240 words) of its source text, at least 1 and at most 6. The topic's text is cut into sentences and spread evenly over the steps. Per step:
 1. **Lesson:** one LLM call returns the lesson text, an example, an insight and 3 multiple-choice questions, grounded only in that step's source text.
 2. **Quiz:** 3 questions. Each has options, the correct index, an explanation and `option_feedback` (one sentence per option saying why it is right or wrong).
 3. **Decide:**

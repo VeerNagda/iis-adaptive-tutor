@@ -74,6 +74,8 @@ public class Topic
     public string Status { get; set; } = "new";
     /// <summary>Not sent to the browser; ids of the source chunks.</summary>
     [JsonIgnore] public List<int> ChunkIds { get; set; } = [];
+    /// <summary>Not sent to the browser; characters of source text, which sets the number of lessons.</summary>
+    [JsonIgnore] public int SourceLength { get; set; }
 }
 
 public class LearnSession
