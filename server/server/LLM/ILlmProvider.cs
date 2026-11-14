@@ -12,7 +12,16 @@ public interface ILlmProvider
     bool IsMock { get; }
 
     Task<string> GenerateAsync(string prompt, CancellationToken ct = default);
+
+    /// <summary>
+    /// Same as above, but the model is also shown images (multimodal input).
+    /// Used during ingestion to turn the pictures in a document into text.
+    /// </summary>
+    Task<string> GenerateAsync(string prompt, IReadOnlyList<LlmImage> images, CancellationToken ct = default);
 }
+
+/// <summary>One image sent to the LLM: the file's bytes and its type, e.g. "image/png".</summary>
+public sealed record LlmImage(byte[] Data, string MimeType);
 
 /// <summary>Thrown when the LLM call fails (network, API error, bad response shape).</summary>
 public sealed class LlmException(string message, Exception? inner = null)

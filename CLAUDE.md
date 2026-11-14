@@ -23,6 +23,9 @@ The LLM only writes content (topics, lessons, questions) as JSON. Scoring, pass 
 
 ### Topics
 - Ingestion is started by hand with the "Ingest" button on a file (no background polling, so LLM quota is only used on request). It produces `chunks` and `document_sections`.
+- Images inside the PDF, PPTX or DOCX are ingested too: the LLM looks at each image and writes a description (`Prompts.Images`), which is added to that page's text as `[Image on this page: ...]` and from then on is taught like any other text. The image itself is not stored or shown.
+  - Which images are sent is plain C# in `IngestionService`: skip files under 5 KB (icons) or over 2 MB, send a repeated image once, at most 20 per document, 5 per LLM call. The LLM returns an empty string for decoration.
+  - Standalone image files cannot be uploaded (only PDF, PPTX, DOCX).
 - Loading the topics list extracts topics (title + summary) from the sections of documents not yet processed (`documents.topics_extracted = 0`) and appends them. Existing topics and progress are never touched.
 
 ### Lesson loop (one session = one topic)
@@ -34,15 +37,15 @@ A topic's source chunks are spread over at most 6 lesson steps. Per step:
    - 1 mistake: pass, next step, level unchanged, and the feedback explains what went wrong with that answer (from `option_feedback`).
    - 2 or more mistakes: level -1 (min 1), the same step is taught again in the easier style with new questions. Repeats until passed; "Skip" is always available.
 
-### Difficulty and teaching style
-- Level 1 (easiest) to 5 (hardest) per topic, starts at 3, stored on the topic and reused in later sessions.
-- `Prompts.StyleForLevel` maps each level to explicit style instructions (L1 plain language, analogy, small steps; L3 standard; L5 concise, technical, edge cases).
 ### Ask the tutor (chat on a lesson)
 - Under every lesson and review lesson the learner can type a question before taking the quiz.
 - One LLM call per question (`Prompts.Ask`), grounded in the lesson text and that step's source text, written in the style of the topic's current level.
 - The chat is kept in the browser and the last 5 turns are sent back with each question, so follow-ups work. It is not stored, and a new lesson starts an empty chat.
 - Asking changes nothing: no phase change and no level change. Not available during a quiz.
 
+### Difficulty and teaching style
+- Level 1 (easiest) to 5 (hardest) per topic, starts at 3, stored on the topic and reused in later sessions.
+- `Prompts.StyleForLevel` maps each level to explicit style instructions (L1 plain language, analogy, small steps; L3 standard; L5 concise, technical, edge cases).
 - Every change is written to `difficulty_history` with its reason.
 
 ### Checkpoint test (inside a topic)
@@ -74,9 +77,9 @@ A topic's source chunks are spread over at most 6 lesson steps. Per step:
 - A "Demo mode" button that submits wrong answers so the adaptive path can be shown reliably; results are labelled as simulated.
 
 ### Status labels (used in the report)
-- Implemented: manual ingestion, topic extraction and refresh, lesson and quiz loop, mistake explanations, adaptive difficulty, checkpoint and review, mandatory topic test, history.
+- Implemented: manual ingestion (text and image descriptions), topic extraction and refresh, lesson and quiz loop, ask-the-tutor chat, mistake explanations, adaptive difficulty, checkpoint and review, mandatory topic test, history.
 - Simulated: demo mode; mock provider if used in the demo.
-- Planned: multimodal teaching, learner profile across courses, accessibility review, user study.
+- Planned: multimodal teaching (showing images in lessons), learner profile across courses, accessibility review, user study.
 
 ### Working rules
 - Small commits with clear messages (the commit history is assessed as the development record).

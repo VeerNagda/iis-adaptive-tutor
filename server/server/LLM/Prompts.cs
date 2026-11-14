@@ -15,12 +15,13 @@ namespace server.LLM;
 /// </summary>
 public static class Prompts
 {
+    public const string ImagesTask = "[[TASK:IMAGES]]";
     public const string SectionsTask = "[[TASK:SECTIONS]]";
     public const string TopicsTask = "[[TASK:TOPICS]]";
     public const string LessonTask = "[[TASK:LESSON]]";
     public const string CheckpointTask = "[[TASK:CHECKPOINT]]";
-
     public const string AskTask = "[[TASK:ASK]]";
+
     /// <summary>Questions per lesson quiz. Pass = at most one mistake (see LearningService).</summary>
     public const int QuizSize = 3;
 
@@ -69,6 +70,34 @@ public static class Prompts
         4 => "Advanced",
         _ => "Expert",
     };
+
+    // ── Ingestion: turn the images of a document into text ────────────────────
+    // The images themselves are attached to the request (see GeminiProvider);
+    // this prompt only says what to do with them. Everything after ingestion
+    // (chunks, topics, lessons, quizzes) works on text, so a picture can only
+    // be taught if it is first written down. Design choices:
+    //   - "describe only what is visible": the description becomes SOURCE for
+    //     lessons, so it must not contain invented facts;
+    //   - an empty string for decoration (logos, backgrounds), so those do not
+    //     end up in the lessons;
+    //   - one string per image, in order, so C# can put each description back
+    //     on the page the image came from.
+    public static string Images(int count) => $$"""
+        {{ImagesTask}}
+        You are preparing study material for a tutoring app. Attached are {{count}} images taken
+        from a learner's uploaded lecture file, in order.
+
+        For each image write a description that a tutor could teach from, in at most 120 words:
+          - say what kind of image it is (diagram, chart, table, screenshot, photo, scanned page);
+          - say what it shows: its parts, labels and values, and how they relate to each other;
+          - copy any important text in the image word for word.
+        Describe only what is visible. Do not guess and do not add outside knowledge.
+        If an image is only decoration (logo, icon, background, a photo with no teaching content),
+        return an empty string for it.
+
+        Return JSON only, in exactly this shape, with exactly {{count}} strings in the same order as the images:
+        {"descriptions":["...","..."]}
+        """;
 
     // ── Ingestion: group a document's chunks into learning sections ───────────
     public static string Sections(string chunkSummary) => $$"""
@@ -172,31 +201,6 @@ public static class Prompts
             """;
     }
 
-    // ── Checkpoint test: questions over several completed lessons ─────────────
-    // Only the questions on the CURRENT topic come from this prompt. The
-    // "few questions from earlier topics" are picked from the database by C#
-    // (questions the learner has already seen), so no LLM call is needed for them.
-    public static string Checkpoint(string topicTitle, string source, int level, int count) => $$"""
-        {{CheckpointTask}}
-        You are writing a short checkpoint test for the topic "{{topicTitle}}".
-        The learner has just finished several lessons based on SOURCE below.
-
-        Write exactly {{count}} multiple-choice questions spread across the whole of SOURCE
-        (not all on one part). Use only facts found in SOURCE.
-        {{QuestionRules}}
-
-        DIFFICULTY LEVEL: {{level}} of 5 (1 = easiest, 5 = hardest)
-        STYLE for this level (use its guidance on quiz questions):
-        {{StyleForLevel(level)}}
-
-        Return JSON only, in exactly this shape:
-        {"questions":[{{QuestionShape}}]}
-
-        <<<SOURCE
-        {{source}}
-        SOURCE>>>
-        """;
-}
     // ── Ask the tutor: answer a learner's question about the lesson on screen ─
     // The model has no memory between calls, so everything it needs is sent
     // again each time:
@@ -252,3 +256,28 @@ public static class Prompts
             """;
     }
 
+    // ── Checkpoint test: questions over several completed lessons ─────────────
+    // Only the questions on the CURRENT topic come from this prompt. The
+    // "few questions from earlier topics" are picked from the database by C#
+    // (questions the learner has already seen), so no LLM call is needed for them.
+    public static string Checkpoint(string topicTitle, string source, int level, int count) => $$"""
+        {{CheckpointTask}}
+        You are writing a short checkpoint test for the topic "{{topicTitle}}".
+        The learner has just finished several lessons based on SOURCE below.
+
+        Write exactly {{count}} multiple-choice questions spread across the whole of SOURCE
+        (not all on one part). Use only facts found in SOURCE.
+        {{QuestionRules}}
+
+        DIFFICULTY LEVEL: {{level}} of 5 (1 = easiest, 5 = hardest)
+        STYLE for this level (use its guidance on quiz questions):
+        {{StyleForLevel(level)}}
+
+        Return JSON only, in exactly this shape:
+        {"questions":[{{QuestionShape}}]}
+
+        <<<SOURCE
+        {{source}}
+        SOURCE>>>
+        """;
+}

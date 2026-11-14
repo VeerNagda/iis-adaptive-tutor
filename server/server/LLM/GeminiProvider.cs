@@ -31,11 +31,23 @@ public sealed class GeminiProvider(HttpClient http, IConfiguration config, ILogg
     // Delays in milliseconds for each retry attempt (4 retries total).
     private static readonly int[] RetryDelaysMs = [1_000, 2_000, 4_000, 8_000];
 
-    public async Task<string> GenerateAsync(string prompt, CancellationToken ct = default)
+    public Task<string> GenerateAsync(string prompt, CancellationToken ct = default) =>
+        GenerateAsync(prompt, [], ct);
+
+    public async Task<string> GenerateAsync(string prompt, IReadOnlyList<LlmImage> images, CancellationToken ct = default)
     {
+        // A Gemini message is a list of "parts". A text-only prompt has one text
+        // part. For multimodal input each image is added as its own part:
+        // inline_data carries the image inside the request itself, as base64 text
+        // (JSON cannot hold raw bytes) together with its MIME type. The model
+        // reads the parts in order, so the prompt can say "the images, in order".
+        var parts = new List<object> { new { text = prompt } };
+        foreach (var image in images)
+            parts.Add(new { inline_data = new { mime_type = image.MimeType, data = Convert.ToBase64String(image.Data) } });
+
         var requestBody = new
         {
-            contents = new[] { new { parts = new[] { new { text = prompt } } } },
+            contents = new[] { new { parts } },
             // responseMimeType tells Gemini to return clean JSON without markdown fences.
             generationConfig = new { responseMimeType = "application/json" }
         };

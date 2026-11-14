@@ -28,6 +28,16 @@ public sealed class MockLlmProvider : ILlmProvider
         return Task.FromResult(json);
     }
 
+    // ── Images: one canned description per image, so image ingestion can be
+    //    followed through the pipeline without a real (vision) model ───────────
+    public Task<string> GenerateAsync(string prompt, IReadOnlyList<LlmImage> images, CancellationToken ct = default)
+    {
+        var descriptions = images.Select((image, i) =>
+            $"(MOCK image description {i + 1}) A real LLM would describe this {image.MimeType} image "
+            + $"({image.Data.Length / 1024} KB) here.");
+        return Task.FromResult(JsonSerializer.Serialize(new { descriptions }));
+    }
+
     // ── Sections: spread the chunks listed in the prompt over up to 4 sections ─
     private static string MockSections(string prompt)
     {
@@ -100,16 +110,6 @@ public sealed class MockLlmProvider : ILlmProvider
         return JsonSerializer.Serialize(new { questions = MockQuestions(title, count) });
     }
 
-    /// <summary>First few words of the text between the SOURCE markers of a prompt.</summary>
-    private static string SourceExcerpt(string prompt, int words)
-    {
-        var source = Regex.Match(prompt, @"<<<SOURCE\s*(.*?)\s*SOURCE>>>", RegexOptions.Singleline).Groups[1].Value;
-        return string.Join(" ", source.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Take(words));
-    }
-
-    /// <summary>
-    /// Canned questions. A random set number makes every quiz "new" (as a real
-    /// re-quiz would be), and the correct option moves between questions.
     // ── Ask the tutor: echoes the question so the chat is visibly working ─────
     private static string MockAnswer(string prompt)
     {
@@ -121,6 +121,16 @@ public sealed class MockLlmProvider : ILlmProvider
         });
     }
 
+    /// <summary>First few words of the text between the SOURCE markers of a prompt.</summary>
+    private static string SourceExcerpt(string prompt, int words)
+    {
+        var source = Regex.Match(prompt, @"<<<SOURCE\s*(.*?)\s*SOURCE>>>", RegexOptions.Singleline).Groups[1].Value;
+        return string.Join(" ", source.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Take(words));
+    }
+
+    /// <summary>
+    /// Canned questions. A random set number makes every quiz "new" (as a real
+    /// re-quiz would be), and the correct option moves between questions.
     /// </summary>
     private static object[] MockQuestions(string title, int count)
     {

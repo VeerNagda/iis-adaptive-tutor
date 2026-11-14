@@ -1,17 +1,21 @@
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Presentation;
+using server.LLM;
 using UglyToad.PdfPig;
 using A = DocumentFormat.OpenXml.Drawing;
 
 namespace server.Services;
 
 /// <summary>
-/// Extracts plain text from PDF, DOCX, and PPTX files, returning one entry per page or slide.
-/// Page numbers are 1-based throughout.
+/// Extracts the plain text and the embedded images from PDF, DOCX, and PPTX files,
+/// returning one entry per page or slide. Page numbers are 1-based throughout.
+///
+/// Images are only collected here. IngestionService sends them to the LLM, which
+/// writes a description of each one; that description is then added to the page's text.
 /// </summary>
 public static class TextExtractor
 {
-    public sealed record PageText(int PageNumber, string Text);
+    public sealed record PageText(int PageNumber, string Text, IReadOnlyList<LlmImage> Images);
 
     public static IReadOnlyList<PageText> Extract(string filePath, string fileType) =>
         fileType.ToLowerInvariant() switch
@@ -19,9 +23,15 @@ public static class TextExtractor
             "pdf"  => ExtractPdf(filePath),
             "docx" => ExtractDocx(filePath),
             "pptx" => ExtractPptx(filePath),
-            "txt"  => [new PageText(1, File.ReadAllText(filePath))],
+            "txt"  => [new PageText(1, File.ReadAllText(filePath), [])],
             _      => throw new NotSupportedException($"Unsupported file type: {fileType}")
         };
+
+    /// <summary>A page is kept if it has text or at least one image (e.g. a scanned page).</summary>
+    private static bool HasContent(PageText p) => !string.IsNullOrWhiteSpace(p.Text) || p.Images.Count > 0;
+
+    /// <summary>Image formats the LLM accepts. Others (EMF, WMF, GIF, ...) are skipped.</summary>
+    private static bool IsSupported(string mimeType) => mimeType is "image/png" or "image/jpeg" or "image/webp";
 
     // ── PDF ───────────────────────────────────────────────────────────────────
 
@@ -31,9 +41,36 @@ public static class TextExtractor
         return doc.GetPages()
                   .Select(p => new PageText(
                       p.Number,
-                      string.Join(" ", p.GetWords().Select(w => w.Text))))
-                  .Where(p => !string.IsNullOrWhiteSpace(p.Text))
+                      string.Join(" ", p.GetWords().Select(w => w.Text)),
+                      PdfImages(p)))
+                  .Where(HasContent)
                   .ToList();
+    }
+
+    /// <summary>
+    /// The images on one PDF page. A PDF stores images in its own internal formats:
+    /// PdfPig can convert most of them to PNG; photos are usually stored as a
+    /// complete JPEG file (it starts with the bytes FF D8), which is used as it is.
+    /// Anything else is skipped.
+    /// </summary>
+    private static List<LlmImage> PdfImages(UglyToad.PdfPig.Content.Page page)
+    {
+        var images = new List<LlmImage>();
+        foreach (var image in page.GetImages())
+        {
+            try
+            {
+                if (image.TryGetPng(out var png))
+                    images.Add(new LlmImage(png, "image/png"));
+                else if (image.RawBytes.Length > 2 && image.RawBytes[0] == 0xFF && image.RawBytes[1] == 0xD8)
+                    images.Add(new LlmImage(image.RawBytes.ToArray(), "image/jpeg"));
+            }
+            catch (Exception)
+            {
+                // A damaged or unusual image must not stop the whole document: skip it.
+            }
+        }
+        return images;
     }
 
     // ── DOCX ──────────────────────────────────────────────────────────────────
@@ -43,16 +80,24 @@ public static class TextExtractor
     private static IReadOnlyList<PageText> ExtractDocx(string path)
     {
         using var doc = WordprocessingDocument.Open(path, false);
-        var body = doc.MainDocumentPart?.Document?.Body
+        var main = doc.MainDocumentPart;
+        var body = main?.Document?.Body
             ?? throw new InvalidDataException("DOCX has no body.");
 
         var pages = new List<PageText>();
         int pageNum = 1;
         int paraCount = 0;
         var current = new System.Text.StringBuilder();
+        var images = new List<LlmImage>();
 
         foreach (var para in body.Elements<DocumentFormat.OpenXml.Wordprocessing.Paragraph>())
         {
+            // A picture sits inside a paragraph as a "blip" that points (by id) at
+            // the image file stored in the document.
+            foreach (var blip in para.Descendants<A.Blip>())
+                if (blip.Embed?.Value is { } id && main!.GetPartById(id) is ImagePart part && IsSupported(part.ContentType))
+                    images.Add(ReadImage(part));
+
             var text = para.InnerText.Trim();
             if (string.IsNullOrWhiteSpace(text)) continue;
 
@@ -62,13 +107,14 @@ public static class TextExtractor
             // Treat every 40 paragraphs as a new virtual page.
             if (paraCount % 40 == 0)
             {
-                pages.Add(new PageText(pageNum++, current.ToString().Trim()));
+                pages.Add(new PageText(pageNum++, current.ToString().Trim(), images));
                 current.Clear();
+                images = [];
             }
         }
 
-        if (current.Length > 0)
-            pages.Add(new PageText(pageNum, current.ToString().Trim()));
+        if (current.Length > 0 || images.Count > 0)
+            pages.Add(new PageText(pageNum, current.ToString().Trim(), images));
 
         return pages;
     }
@@ -90,9 +136,19 @@ public static class TextExtractor
                     (slide.Slide?.Descendants<A.Text>() ?? [])
                                .Select(t => t.Text)
                                .Where(t => !string.IsNullOrWhiteSpace(t)));
-                return new PageText(i + 1, text);
+                // The picture files used on this slide.
+                var images = slide.ImageParts.Where(p => IsSupported(p.ContentType)).Select(ReadImage).ToList();
+                return new PageText(i + 1, text, images);
             })
-            .Where(p => !string.IsNullOrWhiteSpace(p.Text))
+            .Where(HasContent)
             .ToList();
+    }
+
+    private static LlmImage ReadImage(ImagePart part)
+    {
+        using var stream = part.GetStream();
+        using var memory = new MemoryStream();
+        stream.CopyTo(memory);
+        return new LlmImage(memory.ToArray(), part.ContentType);
     }
 }

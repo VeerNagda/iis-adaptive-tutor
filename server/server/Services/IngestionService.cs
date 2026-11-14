@@ -10,7 +10,8 @@ namespace server.Services;
 /// Runs the full ingestion pipeline for one uploaded document and provides chunk search.
 ///
 /// Pipeline steps:
-///   1. Extract text per page (TextExtractor — PdfPig / OpenXml).
+///   1. Extract text and embedded images per page (TextExtractor — PdfPig / OpenXml).
+///   1b. Ask the LLM to describe the images; add the descriptions to the page text.
 ///   2. Split pages into ~400-word chunks in C# (paragraph-aware).
 ///   3. Call ILlmProvider to generate 4–8 learning sections from the chunk list.
 ///   4. Embed all chunk texts via IGeminiEmbedder (768-dim, RETRIEVAL_DOCUMENT).
@@ -39,10 +40,13 @@ public sealed class IngestionService(
             if (!File.Exists(filePath))
                 throw new FileNotFoundException($"File not on disk: {filePath}");
 
-            // Step 1 – extract text
-            var pages = TextExtractor.Extract(filePath, fileType);
+            // Step 1 – extract text and images
+            var extracted = TextExtractor.Extract(filePath, fileType);
+
+            // Step 1b – the LLM describes the images; the descriptions join the page text
+            var pages = await DescribeImagesAsync(extracted, ct);
             if (pages.Count == 0)
-                throw new InvalidOperationException("No text could be extracted from the file.");
+                throw new InvalidOperationException("No text or usable images could be extracted from the file.");
 
             // Step 2 – chunk
             var chunks = SplitIntoChunks(pages, targetWords: 400);
@@ -124,6 +128,81 @@ public sealed class IngestionService(
             .OrderByDescending(r => r.score)
             .Take(k)
             .Select(r => r.chunk)
+            .ToList();
+    }
+
+    // ── Step 1b: Image descriptions ────────────────────────────────────────────
+    //
+    // The rest of the system works on text only, so each picture is turned into
+    // text once, here: the LLM looks at the image and writes a description, which
+    // is added to the text of the page it came from as
+    //     [Image on this page: ...]
+    // From then on it is chunked, grouped into topics and taught like any other
+    // sentence of the document. The image itself is not stored or shown.
+    //
+    // Which images are sent is decided by the plain rules below (not by the LLM),
+    // to keep the number of LLM calls small and predictable.
+
+    /// <summary>Smaller files are almost always icons, bullets or lines.</summary>
+    private const int MinImageBytes = 5_000;
+    /// <summary>Larger files are skipped to keep the request within the API's size limit.</summary>
+    private const int MaxImageBytes = 2_000_000;
+    /// <summary>At most this many images are described per document.</summary>
+    private const int MaxImagesPerDocument = 20;
+    /// <summary>Images sent in one LLM call (so 20 images cost 4 calls, not 20).</summary>
+    private const int ImagesPerCall = 5;
+
+    private async Task<List<TextExtractor.PageText>> DescribeImagesAsync(
+        IReadOnlyList<TextExtractor.PageText> pages, CancellationToken ct)
+    {
+        // Pick the images worth describing, remembering which page each is on.
+        var picked = new List<(int PageIndex, LlmImage Image)>();
+        var seen = new HashSet<string>();   // an image repeated on every slide (a logo) is sent once
+        int found = 0;
+        for (int p = 0; p < pages.Count; p++)
+        {
+            foreach (var image in pages[p].Images)
+            {
+                found++;
+                if (image.Data.Length is < MinImageBytes or > MaxImageBytes) continue;
+                if (!seen.Add(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(image.Data)))) continue;
+                if (picked.Count < MaxImagesPerDocument) picked.Add((p, image));
+            }
+        }
+        log.LogInformation("{Found} images found, {Picked} sent for description", found, picked.Count);
+
+        // One LLM call per batch; each description goes back to its page.
+        var described = pages.Select(_ => new StringBuilder()).ToList();
+        foreach (var batch in picked.Chunk(ImagesPerCall))
+        {
+            var json = await llm.GenerateAsync(
+                Prompts.Images(batch.Length), batch.Select(b => b.Image).ToList(), ct);
+
+            List<string> descriptions;
+            try
+            {
+                descriptions = JsonSerializer.Deserialize<Models.LlmImageDescriptions>(json)?.Descriptions ?? [];
+            }
+            catch (JsonException ex)
+            {
+                throw new LlmException("The AI reply for the images was not in the expected format. Please retry.", ex);
+            }
+
+            for (int i = 0; i < batch.Length && i < descriptions.Count; i++)
+            {
+                // An empty description means the LLM judged the image to be decoration.
+                if (string.IsNullOrWhiteSpace(descriptions[i])) continue;
+                // Kept on one line so the chunker treats it as one paragraph.
+                var oneLine = descriptions[i].ReplaceLineEndings(" ").Trim();
+                described[batch[i].PageIndex].AppendLine($"[Image on this page: {oneLine}]");
+            }
+        }
+
+        // Text first, then the image descriptions. The image bytes are no longer
+        // needed; pages that still have nothing to teach are dropped.
+        return pages
+            .Select((page, i) => page with { Text = $"{page.Text}\n{described[i]}".Trim(), Images = [] })
+            .Where(page => page.Text.Length > 0)
             .ToList();
     }
 

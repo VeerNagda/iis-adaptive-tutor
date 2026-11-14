@@ -7,6 +7,12 @@ namespace server.Models;
 // reply is deserialized straight into these classes. [JsonPropertyName] pins
 // the JSON key so the prompt and the class cannot drift apart silently.
 
+/// <summary>Ingestion: one description per image sent, in the same order ("" = decoration).</summary>
+public class LlmImageDescriptions
+{
+    [JsonPropertyName("descriptions")] public List<string> Descriptions { get; set; } = [];
+}
+
 public class LlmTopicList
 {
     [JsonPropertyName("topics")] public List<LlmTopic> Topics { get; set; } = [];
@@ -49,18 +55,18 @@ public class LlmQuestion
     [JsonPropertyName("option_feedback")] public List<string> OptionFeedback { get; set; } = [];
 }
 
-// ══ 2. Database rows used by LearningService ═════════════════════════════════
-
-public class Topic
-{
-    public int Id { get; set; }
-    public int CourseId { get; set; }
 /// <summary>The tutor's answer to a question the learner asked about a lesson.</summary>
 public class LlmAnswer
 {
     [JsonPropertyName("answer")] public string Answer { get; set; } = "";
 }
 
+// ══ 2. Database rows used by LearningService ═════════════════════════════════
+
+public class Topic
+{
+    public int Id { get; set; }
+    public int CourseId { get; set; }
     public string Title { get; set; } = "";
     public string? Summary { get; set; }
     public int SequenceNumber { get; set; }
@@ -146,12 +152,6 @@ public class QuestionDto
     public string? Label { get; set; }              // e.g. "Refresher from: Topic X"
 }
 
-public class SubmitAnswersRequest
-{
-    /// <summary>Chosen option index for each question, in the order the quiz was shown.</summary>
-    public List<int> Answers { get; set; } = [];
-    /// <summary>Demo mode: the server fills in wrong answers so the re-teach path can be shown.</summary>
-    public bool SimulateWrong { get; set; }
 /// <summary>A question the learner asks about the lesson on screen ("Ask the tutor").</summary>
 public class AskRequest
 {
@@ -174,6 +174,12 @@ public class AskResponse
     public string Answer { get; set; } = "";
 }
 
+public class SubmitAnswersRequest
+{
+    /// <summary>Chosen option index for each question, in the order the quiz was shown.</summary>
+    public List<int> Answers { get; set; } = [];
+    /// <summary>Demo mode: the server fills in wrong answers so the re-teach path can be shown.</summary>
+    public bool SimulateWrong { get; set; }
 }
 
 public class AnswerResult
