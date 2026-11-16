@@ -29,9 +29,9 @@ var forceMock = "Mock".Equals(builder.Configuration["LlmProvider"], StringCompar
 var useGemini = !forceMock && LlmKey.Read(builder.Configuration) is not null;
 if (useGemini)
 {
-    // HttpClient gives up after 100 seconds by default. A call that sends several
-    // images (ingestion) can take longer than that, so the limit is raised.
-    builder.Services.AddHttpClient<GeminiProvider>(client => client.Timeout = TimeSpan.FromMinutes(5));
+    // HttpClient gives up after 100 seconds by default. A call that sends images
+    // (ingestion) has been seen to take almost 5 minutes, so the limit is 10 minutes.
+    builder.Services.AddHttpClient<GeminiProvider>(client => client.Timeout = TimeSpan.FromMinutes(10));
     // Resolved through the typed client above, so that this timeout is the one used.
     builder.Services.AddSingleton<ILlmProvider>(sp => sp.GetRequiredService<GeminiProvider>());
 

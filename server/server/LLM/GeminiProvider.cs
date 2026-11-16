@@ -54,9 +54,38 @@ public sealed class GeminiProvider(HttpClient http, IConfiguration config, ILogg
 
         var url = $"https://generativelanguage.googleapis.com/v1beta/models/{_model}:generateContent?key={_apiKey}";
 
+        // Only used for the log line below: how long the call took and how much was sent.
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        double sentMb = images.Sum(i => i.Data.Length) / 1_000_000.0;
+
+        // A call with no pictures should answer within seconds, so one that is silent
+        // for 2 minutes is stuck and is better asked again. Calls with pictures
+        // legitimately take minutes. The HttpClient's own 10 minute limit is the last resort.
+        var timeout = images.Count == 0 ? TimeSpan.FromMinutes(2) : TimeSpan.FromMinutes(8);
+        int timeouts = 0;
+
         for (int attempt = 0; ; attempt++)
         {
-            using var response = await http.PostAsJsonAsync(url, requestBody, ct);
+            using var attemptTimer = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            attemptTimer.CancelAfter(timeout);
+
+            HttpResponseMessage response;
+            try
+            {
+                response = await http.PostAsJsonAsync(url, requestBody, attemptTimer.Token);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                // Our timer ran out (the caller did not cancel): Gemini never answered.
+                // Asked once more, then reported, so a stuck service cannot hold the app for long.
+                if (++timeouts <= 1)
+                {
+                    log.LogWarning("Gemini did not answer within {Min} minutes, asking again.", timeout.TotalMinutes);
+                    continue;
+                }
+                throw new LlmException($"Gemini did not answer within {timeout.TotalMinutes:0} minutes (twice). The service may be overloaded. Please retry in a few minutes.");
+            }
+            using var _ = response;
 
             if (!response.IsSuccessStatusCode)
             {
@@ -88,6 +117,17 @@ public sealed class GeminiProvider(HttpClient http, IConfiguration config, ILogg
             try
             {
                 using var doc = JsonDocument.Parse(raw);
+
+                // Shows why a call was slow: a large upload, or a large thinking
+                // token count (the model reasoning before it answers).
+                var usage = doc.RootElement.TryGetProperty("usageMetadata", out var u) ? u : default;
+                int Tokens(string name) =>
+                    usage.ValueKind == JsonValueKind.Object && usage.TryGetProperty(name, out var v) ? v.GetInt32() : 0;
+                log.LogInformation(
+                    "Gemini answered in {Sec:F0} s: {Images} images ({Mb:F1} MB sent), tokens: prompt {P}, thinking {T}, answer {A}.",
+                    timer.Elapsed.TotalSeconds, images.Count, sentMb,
+                    Tokens("promptTokenCount"), Tokens("thoughtsTokenCount"), Tokens("candidatesTokenCount"));
+
                 return doc.RootElement
                            .GetProperty("candidates")[0]
                            .GetProperty("content")
