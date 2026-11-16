@@ -314,7 +314,15 @@ function MaterialsPanel({ courseId, onIngested, refresh }: { courseId: string; o
                 </span>
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm text-zinc-700" title={doc.filename}>{doc.filename}</p>
-                  <p className={`text-xs ${status.cls}`}>
+                  {/* While this file is being ingested the line is blue with a spinning icon,
+                      whatever the saved status was (a retried file would otherwise stay red). */}
+                  <p className={`flex items-center gap-1.5 text-xs ${ingestingId === doc.id ? "font-medium text-blue-600" : status.cls}`}>
+                    {ingestingId === doc.id && (
+                      <svg className="h-3.5 w-3.5 shrink-0 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" className="opacity-25" />
+                        <path d="M4 12a8 8 0 018-8" stroke="currentColor" strokeWidth="4" strokeLinecap="round" />
+                      </svg>
+                    )}
                     {ingestingId === doc.id ? "Ingesting… this can take a minute" : status.label}
                     <span className="text-zinc-400"> · uploaded {formatDate(doc.uploadedAt)}</span>
                   </p>
