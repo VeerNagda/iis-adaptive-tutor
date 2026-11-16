@@ -117,6 +117,8 @@ npm run dev
 
 **Gemini key.** Set the `GEMINI_API_KEY` environment variable, or `GeminiAPI:APIKEY` in user-secrets or the git-ignored `appsettings.Development.json`. Never commit a key.
 
+**Model fallback.** `GeminiAPI:Model` is tried first. `GeminiAPI:FallbackModels` (comma-separated; `GEMINI_FALLBACK_MODELS` in `.env` for Docker) lists the models tried in order when a model's quota is used up, it keeps failing with 429 or 503, it does not answer in time, or its name is not found. A failed model is skipped for a while. The server log says which model answered.
+
 **Auto-ingest.** Off by default, so files are ingested with the "Ingest" button. Set `AutoIngest=true` (or `AUTO_INGEST=true` in `.env` for Docker) to ingest uploads automatically. It polls every 30 seconds and retries failed files, so it can use up Gemini credits quickly.
 
 **Mock mode.** With no key, or with `LlmProvider=Mock`, the app uses the mock provider and spends no quota. Mock mode is chosen at start-up only.

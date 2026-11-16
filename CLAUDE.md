@@ -76,6 +76,7 @@ A quiz is handled in two steps. Submitting stores the answers and returns a prev
 - One `ILlmProvider` interface with two implementations: `GeminiProvider` (plain `HttpClient`, JSON output) and `MockLlmProvider` (canned content marked "(MOCK)", so the whole flow runs with no key).
 - The key is read from the `GEMINI_API_KEY` environment variable, or `GeminiAPI:APIKEY` from user-secrets / the git-ignored `appsettings.Development.json`. No key, or `LlmProvider=Mock`, means mock mode, and the UI shows a "MOCK MODE" badge.
 - Replies are deserialized into the `Llm*` classes in `Models/Learning.cs`. If parsing fails, return a clear error and let the user retry.
+- `GeminiProvider` tries `GeminiAPI:Model`, then each model of `GeminiAPI:FallbackModels` (comma-separated), when a model's quota is used up, it keeps returning 429 or 503, it does not answer in time, or the name is not found. A failed model is skipped for a while. A 400 is not passed on (every model would refuse it).
 - Never commit API keys.
 
 ### Database
