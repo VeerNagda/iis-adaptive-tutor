@@ -382,6 +382,11 @@ function TopicsPanel({ courseId, onMockMode, onLoaded }: { courseId: string; onM
   const [startingId, setStartingId] = useState<number | null>(null);
 
   // State is only set inside the promise callbacks (never synchronously in the effect).
+  //
+  // Next keeps this page alive while a lesson is open (cacheComponents), so coming back
+  // does not start from fresh state: "startingId" would still be set and every Start
+  // button would stay disabled. React runs this effect again when the page is shown
+  // again, so the reload below also clears startingId and refreshes the topic statuses.
   const load = useCallback(
     () =>
       apiService
@@ -393,7 +398,10 @@ function TopicsPanel({ courseId, onMockMode, onLoaded }: { courseId: string; onM
           onLoaded();
         })
         .catch((e: Error) => setError(e.message))
-        .finally(() => setLoading(false)),
+        .finally(() => {
+          setLoading(false);
+          setStartingId(null);
+        }),
     [courseId, onMockMode, onLoaded]
   );
 
