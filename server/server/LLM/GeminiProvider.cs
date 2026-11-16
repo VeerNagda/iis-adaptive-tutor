@@ -11,7 +11,9 @@ namespace server.LLM;
 ///   GEMINI_API_KEY             - environment variable holding the secret key (see LlmKey; never committed)
 ///   GeminiAPI:Model            - the model tried first; defaults to gemini-3.8-flash
 ///   GeminiAPI:FallbackModels   - comma-separated models tried in order when the one before is not
-///                                available (see "Model fallback" below). Empty means no fallback.
+///                                available (see "Model fallback" below).
+///   GeminiAPI:AutoFallback     - true (default): after those, also try the suitable models Gemini lists
+///                                for this key (see "Automatic fallback models").
 ///
 /// Every prompt asks for JSON output via responseMimeType so the caller
 /// receives a clean JSON string rather than markdown-wrapped text.
@@ -46,6 +48,82 @@ public sealed class GeminiProvider(HttpClient http, IConfiguration config, ILogg
 
     // Delays in milliseconds for each retry attempt (4 retries total).
     private static readonly int[] RetryDelaysMs = [1_000, 2_000, 4_000, 8_000];
+
+    // ── Automatic fallback models ──────────────────────────────────────────────
+    //
+    // With GeminiAPI:AutoFallback on (the default) the provider asks Gemini once which
+    // models this key can use and adds the suitable ones after the configured models.
+    // Google's list does not say which models are free or what quota is left, so a
+    // model is only found to be out of quota by trying it: it answers 429 at once and
+    // is skipped for a while (see TryModelAsync). A key with billing turned on pays for
+    // the models it falls back to, so switch AutoFallback off if that is not wanted.
+
+    private List<string>? _autoModels;                       // null until discovery has worked
+    private readonly SemaphoreSlim _discoveryLock = new(1);
+
+    /// <summary>The configured models, then the discovered ones.</summary>
+    private async Task<List<string>> AllModelsAsync(CancellationToken ct)
+    {
+        if (!config.GetValue("GeminiAPI:AutoFallback", true)) return _models;
+
+        if (_autoModels is null)
+        {
+            await _discoveryLock.WaitAsync(ct);
+            try { _autoModels ??= await DiscoverModelsAsync(ct); }
+            finally { _discoveryLock.Release(); }
+        }
+        return _models.Concat(_autoModels ?? []).Distinct().ToList();
+    }
+
+    /// <summary>Most automatic fallbacks added, so a run of unavailable models stays short.</summary>
+    private const int MaxAutoModels = 6;
+
+    /// <summary>
+    /// Lists the models the key can use and keeps the ones that fit this app: text
+    /// models that read images and answer JSON ("flash" models, which includes
+    /// "flash-lite"). Left out: Gemma (cannot read images, so a request would be refused
+    /// rather than passed on), Pro (rarely free), the "latest" aliases, and the audio, image,
+    /// live, embedding, omni and agent models. "lite" models come first because they usually have the larger
+    /// daily allowance, then the newest version first. Returns null if the list could not be fetched.
+    /// </summary>
+    private async Task<List<string>?> DiscoverModelsAsync(CancellationToken ct)
+    {
+        try
+        {
+            var url = $"https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key={_apiKey}";
+            using var doc = JsonDocument.Parse(await http.GetStringAsync(url, ct));
+
+            string[] notWanted =
+                ["tts", "image", "audio", "live", "embed", "transcribe", "robotics", "computer-use", "research", "gemma", "pro", "learnlm", "aqa",
+                 "omni",      // multimodal-output models, not text tutors
+                 "latest"];   // aliases that may point at the model that is already out of quota
+
+            var found = new List<string>();
+            foreach (var m in doc.RootElement.GetProperty("models").EnumerateArray())
+            {
+                var name = (m.GetProperty("name").GetString() ?? "").Replace("models/", "");
+                bool canGenerate = m.TryGetProperty("supportedGenerationMethods", out var methods)
+                    && methods.EnumerateArray().Any(x => x.GetString() == "generateContent");
+                if (canGenerate && name.Contains("flash") && !notWanted.Any(name.Contains))
+                    found.Add(name);
+            }
+
+            var chosen = found
+                .OrderByDescending(n => n.Contains("lite"))
+                .ThenByDescending(n => n, StringComparer.Ordinal)
+                .Where(n => !_models.Contains(n))
+                .Take(MaxAutoModels)
+                .ToList();
+            log.LogInformation("Automatic fallback models: {Models}", chosen.Count == 0 ? "(none found)" : string.Join(", ", chosen));
+            return chosen;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Not fatal: only the configured models are used, and the list is asked for again next time.
+            log.LogWarning("Could not list Gemini models, using only the configured ones: {Msg}", ex.Message);
+            return null;
+        }
+    }
 
     private static List<string> BuildModelList(IConfiguration config)
     {
@@ -84,13 +162,14 @@ public sealed class GeminiProvider(HttpClient http, IConfiguration config, ILogg
 
         // Models that failed recently are left out. If that leaves none, all are tried
         // (better to try a skipped model than to fail without calling anything).
+        var allModels = await AllModelsAsync(ct);
         List<string> candidates;
         lock (_skipLock)
         {
             var now = DateTimeOffset.UtcNow;
-            candidates = _models.Where(m => !_skipUntil.TryGetValue(m, out var until) || until <= now).ToList();
+            candidates = allModels.Where(m => !_skipUntil.TryGetValue(m, out var until) || until <= now).ToList();
         }
-        if (candidates.Count == 0) candidates = _models;
+        if (candidates.Count == 0) candidates = allModels;
 
         ModelUnavailableException? last = null;
         foreach (var model in candidates)
