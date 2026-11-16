@@ -14,7 +14,7 @@
     </ItemGroup>
 
     <ItemGroup>
-        <None Update="database\schema.sql">
+        <None Update="Database\schema.sql">
             <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
         </None>
     </ItemGroup>

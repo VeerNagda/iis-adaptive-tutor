@@ -59,7 +59,7 @@ if (!useGemini)
         + "lessons and quizzes are canned mock content, not generated from an LLM.");
 
 // Initialize DB on startup
-var schemaPath = Path.Combine(AppContext.BaseDirectory, "database", "schema.sql");
+var schemaPath = Path.Combine(AppContext.BaseDirectory, "Database", "schema.sql");
 var dbFactory = app.Services.GetRequiredService<IDbConnectionFactory>();
 DatabaseInitializer.Initialize(dbFactory, schemaPath);
 
