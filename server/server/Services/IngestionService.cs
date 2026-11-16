@@ -331,6 +331,8 @@ public sealed class IngestionService(
     public const int MaxImagesPerDocument = 20;
     /// <summary>Images sent in one LLM call (so 20 images cost 4 calls, not 20).</summary>
     private const int ImagesPerCall = 5;
+    /// <summary>How many of those calls are in flight at the same time.</summary>
+    private const int MaxParallelCalls = 3;
 
     private async Task<List<TextExtractor.PageText>> DescribeImagesAsync(
         int documentId, IReadOnlyList<TextExtractor.PageText> pages, IngestReport report,
@@ -354,26 +356,42 @@ public sealed class IngestionService(
         }
         log.LogInformation("{Found} images found, {Picked} sent for description", report.ImagesFound, picked.Count);
 
-        // One LLM call per batch; each description goes back to its page.
-        var described = pages.Select(_ => new StringBuilder()).ToList();
-        foreach (var batch in picked.Chunk(ImagesPerCall))
-        {
-            // The saved result for this batch is looked up by the content of its images,
-            // so it is only reused for exactly the same pictures.
-            string batchKey = ProgressKey("images", string.Concat(
-                batch.Select(b => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(b.Image.Data)))));
+        // One LLM call per batch. Up to MaxParallelCalls batches are asked at the same
+        // time, because each call can take minutes and they do not depend on each other.
+        // Only the asking runs in parallel: the answers are applied below one batch at
+        // a time, in order, so the counts and the page text come out the same as before.
+        var batches = picked.Chunk(ImagesPerCall).ToList();
+        var results = new List<string>?[batches.Count];     // descriptions of each batch, by position
+        var gate = new SemaphoreSlim(MaxParallelCalls);
+        var saveLock = new object();                          // 'saved' and the database write are shared
+        bool failed = false;                                  // once a batch fails, batches not yet started are skipped
 
-            List<string> descriptions;
-            if (saved.TryGetValue(batchKey, out var savedJson))
+        async Task AskBatchAsync(int n)
+        {
+            await gate.WaitAsync(ct);
+            try
             {
-                descriptions = JsonSerializer.Deserialize<List<string>>(savedJson) ?? [];
-                report.ResultsReused++;
-                log.LogInformation("Reusing the saved description of {N} images (no AI call).", batch.Length);
-            }
-            else
-            {
+                if (failed) return;
+                var batch = batches[n];
+
+                // The saved result for this batch is looked up by the content of its images,
+                // so it is only reused for exactly the same pictures.
+                string batchKey = ProgressKey("images", string.Concat(
+                    batch.Select(b => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(b.Image.Data)))));
+
+                string? savedJson;
+                lock (saveLock) saved.TryGetValue(batchKey, out savedJson);
+                if (savedJson is not null)
+                {
+                    results[n] = JsonSerializer.Deserialize<List<string>>(savedJson) ?? [];
+                    lock (saveLock) report.ResultsReused++;
+                    log.LogInformation("Reusing the saved description of {N} images (no AI call).", batch.Length);
+                    return;
+                }
+
                 var json = await llm.GenerateAsync(
                     Prompts.Images(batch.Length), batch.Select(b => b.Image).ToList(), ct);
+                List<string> descriptions;
                 try
                 {
                     descriptions = JsonSerializer.Deserialize<LlmImageDescriptions>(LlmJson.Extract(json))?.Descriptions ?? [];
@@ -384,10 +402,34 @@ public sealed class IngestionService(
                 }
 
                 // Saved straight away, so a failure in a later batch or step does not lose it.
-                saved[batchKey] = JsonSerializer.Serialize(descriptions);
-                SaveProgress(documentId, saved);
+                lock (saveLock)
+                {
+                    saved[batchKey] = JsonSerializer.Serialize(descriptions);
+                    SaveProgress(documentId, saved);
+                }
+                results[n] = descriptions;
             }
+            catch
+            {
+                failed = true;
+                throw;
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
 
+        // WhenAll waits for the calls already running, so their answers are saved
+        // even when another batch fails.
+        await Task.WhenAll(Enumerable.Range(0, batches.Count).Select(AskBatchAsync));
+
+        // Each description goes back to its page.
+        var described = pages.Select(_ => new StringBuilder()).ToList();
+        for (int n = 0; n < batches.Count; n++)
+        {
+            var batch = batches[n];
+            var descriptions = results[n]!;
             for (int i = 0; i < batch.Length; i++)
             {
                 // Counted from what actually came back, not from what was asked for.
