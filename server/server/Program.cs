@@ -48,15 +48,22 @@ else
 builder.Services.AddScoped<IngestionService>();
 // Adaptive teaching: topics, lessons, quizzes, checkpoints, history.
 builder.Services.AddScoped<LearningService>();
-// TEMPORARILY DISABLED: auto-ingest polls every 30s (and retries 'failed' docs), burning Gemini credits.
-// Re-enable by uncommenting the next line.
-// builder.Services.AddHostedService<IngestionBackgroundService>();
+// Auto-ingest is OFF by default: it polls every 30s (and retries 'failed' docs),
+// which can use up Gemini credits quickly. Turn it on with AutoIngest=true
+// (env var AUTO_INGEST=true in docker compose). Otherwise files are ingested by
+// hand with the "Ingest" button.
+var autoIngest = builder.Configuration.GetValue<bool>("AutoIngest");
+if (autoIngest)
+    builder.Services.AddHostedService<IngestionBackgroundService>();
 
 var app = builder.Build();
 
 if (!useGemini)
     app.Logger.LogWarning("*** MOCK MODE *** No Gemini API key found (or LlmProvider=Mock): "
         + "lessons and quizzes are canned mock content, not generated from an LLM.");
+
+if (autoIngest)
+    app.Logger.LogWarning("Auto-ingest is ON: uploaded files are ingested automatically and use LLM quota.");
 
 // Initialize DB on startup
 var schemaPath = Path.Combine(AppContext.BaseDirectory, "Database", "schema.sql");

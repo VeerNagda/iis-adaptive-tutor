@@ -117,6 +117,8 @@ npm run dev
 
 **Gemini key.** Set the `GEMINI_API_KEY` environment variable, or `GeminiAPI:APIKEY` in user-secrets or the git-ignored `appsettings.Development.json`. Never commit a key.
 
+**Auto-ingest.** Off by default, so files are ingested with the "Ingest" button. Set `AutoIngest=true` (or `AUTO_INGEST=true` in `.env` for Docker) to ingest uploads automatically. It polls every 30 seconds and retries failed files, so it can use up Gemini credits quickly.
+
 **Mock mode.** With no key, or with `LlmProvider=Mock`, the app uses the mock provider and spends no quota. Mock mode is chosen at start-up only.
 
 **Fresh start.** `adaptive_tutor.db` and `uploads/` are local data and are not committed. Deleting the database file gives a fresh install. New tables and columns are added to an existing database on the next start.

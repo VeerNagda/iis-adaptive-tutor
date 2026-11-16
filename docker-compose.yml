@@ -9,6 +9,8 @@ services:
       # Empty key (or LLM_PROVIDER=Mock) means mock mode: no Gemini quota is used.
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       LlmProvider: ${LLM_PROVIDER:-Auto}
+      # Off by default. See .env.example for the warning.
+      AutoIngest: ${AUTO_INGEST:-false}
       # The browser origin that is allowed to call the API (CORS).
       Cors__Origin: http://localhost:3000
     volumes:

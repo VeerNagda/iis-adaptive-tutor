@@ -22,7 +22,7 @@ A learner creates a course, uploads materials and ingests them. The tutor turns 
 The LLM only writes content (topics, lessons, questions) as JSON. Scoring, pass or fail, difficulty changes, when a test is due and which topics are weak are plain if/else in `LearningService`, so every decision can be explained and is repeatable.
 
 ### Topics
-- Ingestion is started by hand with the "Ingest" button on a file (no background polling, so LLM quota is only used on request). It produces `chunks` and `document_sections`.
+- Ingestion is started by hand with the "Ingest" button on a file (no background polling by default, so LLM quota is only used on request; the optional `AutoIngest=true` setting starts a 30-second poller and is off by default). It produces `chunks` and `document_sections`.
 - Images inside the PDF, PPTX or DOCX are ingested too: the LLM looks at each image and writes a description (`Prompts.Images`), which is added to that page's text as `[Image on this page: ...]` and from then on is taught like any other text. The image itself is not stored or shown.
   - Which images are sent is plain C# in `IngestionService`: skip files under 5 KB (icons) or over 2 MB, send a repeated image once, at most 20 per document, 5 per LLM call. The LLM returns an empty string for decoration.
   - Standalone image files cannot be uploaded (only PDF, PPTX, DOCX).
