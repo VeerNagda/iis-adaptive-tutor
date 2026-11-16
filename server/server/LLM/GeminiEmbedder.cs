@@ -34,7 +34,7 @@ public sealed class GeminiEmbedder(HttpClient http, IConfiguration config, ILogg
         CancellationToken ct = default)
     {
         var all = new List<float[]>(texts.Count);
-        var url = $"https://generativelanguage.googleapis.com/v1beta/{EmbedModel}:batchEmbedContents?key={_apiKey}";
+            var url = $"https://generativelanguage.googleapis.com/v1beta/{EmbedModel}:batchEmbedContents?key={_apiKey}";
 
         for (int i = 0; i < texts.Count; i += 100)
         {

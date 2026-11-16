@@ -9,7 +9,8 @@ builder.Services.AddOpenApi();
 
 builder.Services.AddCors(options =>
     options.AddDefaultPolicy(policy =>
-        policy.WithOrigins("http://localhost:3000")
+        // The frontend's address. Docker compose can override it with Cors__Origin.
+        policy.WithOrigins(builder.Configuration["Cors:Origin"] ?? "http://localhost:3000")
               .AllowAnyHeader()
               .AllowAnyMethod()));
 
@@ -66,7 +67,9 @@ if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 
 app.UseCors();
-app.UseHttpsRedirection();
+// The container only serves plain http, so redirecting to https would break it.
+if (!app.Environment.IsProduction())
+    app.UseHttpsRedirection();
 app.UseAuthorization();
 app.MapControllers();
 

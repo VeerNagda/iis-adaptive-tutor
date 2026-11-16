@@ -113,6 +113,8 @@ npm install
 npm run dev
 ```
 
+**Docker.** From the repository root, `docker compose up --build` starts both parts: the frontend on http://localhost:3000 and the backend on http://localhost:5242. With no key it runs in mock mode. To use Gemini, copy `.env.example` to `.env` and set `GEMINI_API_KEY`. The database and uploads are kept in the `tutor-data` volume; `docker compose down -v` gives a fresh install.
+
 **Gemini key.** Set the `GEMINI_API_KEY` environment variable, or `GeminiAPI:APIKEY` in user-secrets or the git-ignored `appsettings.Development.json`. Never commit a key.
 
 **Mock mode.** With no key, or with `LlmProvider=Mock`, the app uses the mock provider and spends no quota. Mock mode is chosen at start-up only.

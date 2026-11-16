@@ -9,6 +9,9 @@ adaptive_tutor/.next/
 adaptive_tutor/node_modules/
 adaptive_tutor/.env*.local
 
+# Docker compose reads secrets from here
+.env
+
 # ── General ───────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
