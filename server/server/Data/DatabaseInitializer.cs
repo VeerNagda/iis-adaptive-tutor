@@ -97,6 +97,7 @@ public static class DatabaseInitializer
         AddColumn(connection, "topics", "awaiting_test", "INTEGER NOT NULL DEFAULT 0");
         AddColumn(connection, "sessions", "kind", "TEXT NOT NULL DEFAULT 'topic'");
         AddColumn(connection, "documents", "ingest_report", "TEXT");
+        AddColumn(connection, "documents", "ingest_progress", "TEXT");
         AddColumn(connection, "learn_questions", "source_quote", "TEXT");
         AddColumn(connection, "difficulty_history", "question_count", "INTEGER");
         AddColumn(connection, "difficulty_history", "choice", "TEXT");

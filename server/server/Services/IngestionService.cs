@@ -103,6 +103,10 @@ public sealed class IngestionService(
         var report = new IngestReport { FromPage = fromPage, ToPage = toPage };
         string step = "reading the file";
 
+        // AI results kept from an earlier failed attempt (empty on a first run).
+        // Each AI step looks here first and only calls the AI if its result is missing.
+        var saved = LoadProgress(documentId);
+
         try
         {
             var (filePath, fileType, courseId) = GetDocument(documentId);
@@ -122,7 +126,7 @@ public sealed class IngestionService(
 
             // Step 1b – the LLM describes the images; the descriptions join the page text
             step = "describing the pictures";
-            var pages = await DescribeImagesAsync(extracted, report, ct);
+            var pages = await DescribeImagesAsync(documentId, extracted, report, saved, ct);
             report.PagesRead = pages.Count;
             report.PagesNoText = extracted.Count - pages.Count;
             if (pages.Count == 0)
@@ -135,7 +139,7 @@ public sealed class IngestionService(
 
             // Step 3 – generate sections
             step = "grouping the text into sections";
-            var sections = await GenerateSectionsAsync(chunks, ct);
+            var sections = await GenerateSectionsAsync(documentId, chunks, report, saved, ct);
 
             // Step 4 – embed
             step = "indexing the text";
@@ -150,6 +154,7 @@ public sealed class IngestionService(
             StoreSections(documentId, sections);
 
             SaveReport(documentId, report);
+            SaveProgress(documentId, null);   // finished: the saved AI results are no longer needed
             SetStatus(documentId, "completed");
             log.LogInformation("✓ Document {Id} done: {C} chunks, {S} sections",
                 documentId, chunks.Count, sections.Count);
@@ -160,6 +165,7 @@ public sealed class IngestionService(
             // Stored in plain words (LlmFailure.Explain); the raw error is in the log above.
             string why = LlmFailure.Explain(ex);
             report.Failure = $"It stopped while {step}: {why}";
+            report.ResultsSaved = saved.Count;   // kept in the database, so Retry does not pay for them again
             SaveReport(documentId, report);
             SetStatus(documentId, "failed", why);
             throw;
@@ -199,7 +205,10 @@ public sealed class IngestionService(
         if (r.Failure is not null)
         {
             text.NotDone.Add($"Ingestion did not finish. {r.Failure}");
-            text.NotDone.Add("Nothing from this file is being taught. Press Retry to run it again.");
+            text.NotDone.Add("Nothing from this file is being taught. Press Retry to run it again"
+                + (r.ResultsSaved > 0
+                    ? $" - the {Plural(r.ResultsSaved, "AI result", "AI results")} already received {(r.ResultsSaved == 1 ? "is" : "are")} saved and will not be asked for again."
+                    : "."));
             if (r.PagesRead > 0) text.Done.Add($"Before it stopped: read {r.PagesRead} of {inRange} {r.Unit}.");
             if (r.ImagesDescribed > 0) text.Done.Add($"Before it stopped: {Plural(r.ImagesDescribed, "picture", "pictures")} described.");
             return text;
@@ -208,6 +217,8 @@ public sealed class IngestionService(
 
         // Pages
         text.Done.Add($"Read {r.PagesRead} of {r.PagesTotal} {r.Unit}.");
+        if (r.ResultsReused > 0)
+            text.Done.Add($"Continued from an earlier attempt: {Plural(r.ResultsReused, "AI result was", "AI results were")} reused, so the AI was not asked for {(r.ResultsReused == 1 ? "it" : "them")} again.");
         if (r.PagesOutsideRange > 0)
             text.NotDone.Add($"{Plural(r.PagesOutsideRange, unitOne, r.Unit)} outside your chosen range "
                 + $"({r.FromPage ?? 1}-{r.ToPage ?? r.PagesTotal}) not read. To add them, remove the file and ingest it again with a wider range.");
@@ -322,7 +333,8 @@ public sealed class IngestionService(
     private const int ImagesPerCall = 5;
 
     private async Task<List<TextExtractor.PageText>> DescribeImagesAsync(
-        IReadOnlyList<TextExtractor.PageText> pages, IngestReport report, CancellationToken ct)
+        int documentId, IReadOnlyList<TextExtractor.PageText> pages, IngestReport report,
+        Dictionary<string, string> saved, CancellationToken ct)
     {
         // Pick the images worth describing, remembering which page each is on.
         // Every image that is not picked is counted under the rule that left it out.
@@ -346,17 +358,34 @@ public sealed class IngestionService(
         var described = pages.Select(_ => new StringBuilder()).ToList();
         foreach (var batch in picked.Chunk(ImagesPerCall))
         {
-            var json = await llm.GenerateAsync(
-                Prompts.Images(batch.Length), batch.Select(b => b.Image).ToList(), ct);
+            // The saved result for this batch is looked up by the content of its images,
+            // so it is only reused for exactly the same pictures.
+            string batchKey = ProgressKey("images", string.Concat(
+                batch.Select(b => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(b.Image.Data)))));
 
             List<string> descriptions;
-            try
+            if (saved.TryGetValue(batchKey, out var savedJson))
             {
-                descriptions = JsonSerializer.Deserialize<LlmImageDescriptions>(LlmJson.Extract(json))?.Descriptions ?? [];
+                descriptions = JsonSerializer.Deserialize<List<string>>(savedJson) ?? [];
+                report.ResultsReused++;
+                log.LogInformation("Reusing the saved description of {N} images (no AI call).", batch.Length);
             }
-            catch (JsonException ex)
+            else
             {
-                throw new LlmException("The AI reply for the images was not in the expected format. Please retry.", ex);
+                var json = await llm.GenerateAsync(
+                    Prompts.Images(batch.Length), batch.Select(b => b.Image).ToList(), ct);
+                try
+                {
+                    descriptions = JsonSerializer.Deserialize<LlmImageDescriptions>(LlmJson.Extract(json))?.Descriptions ?? [];
+                }
+                catch (JsonException ex)
+                {
+                    throw new LlmException("The AI reply for the images was not in the expected format. Please retry.", ex);
+                }
+
+                // Saved straight away, so a failure in a later batch or step does not lose it.
+                saved[batchKey] = JsonSerializer.Serialize(descriptions);
+                SaveProgress(documentId, saved);
             }
 
             for (int i = 0; i < batch.Length; i++)
@@ -443,7 +472,9 @@ public sealed class IngestionService(
 
     // ── Step 3: Section generation ─────────────────────────────────────────────
 
-    private async Task<List<Section>> GenerateSectionsAsync(List<Chunk> chunks, CancellationToken ct)
+    private async Task<List<Section>> GenerateSectionsAsync(
+        int documentId, List<Chunk> chunks, IngestReport report,
+        Dictionary<string, string> saved, CancellationToken ct)
     {
         // Build a compact chunk list to stay within prompt token limits.
         // Truncate each chunk to 400 chars; full text is stored in the DB.
@@ -454,6 +485,24 @@ public sealed class IngestionService(
         // All prompts live in LLM/Prompts.cs so they can be inspected in one place.
         var prompt = Prompts.Sections(chunkSummary);
 
+        // Reuse the sections of an earlier attempt if the prompt is exactly the same
+        // (same text, so same chunks). A changed page range gives a different prompt.
+        string sectionsKey = ProgressKey("sections", prompt);
+        if (saved.TryGetValue(sectionsKey, out var savedJson))
+        {
+            try
+            {
+                var reused = ParseSections(savedJson);
+                report.ResultsReused++;
+                log.LogInformation("Reusing the saved sections (no AI call).");
+                return reused;
+            }
+            catch (Exception ex) when (ex is not LlmException)
+            {
+                saved.Remove(sectionsKey);   // unreadable: ask the AI again
+            }
+        }
+
         // Retry once only on JSON parse failures (bad schema from the model).
         // HTTP errors (429, 503, etc.) are already retried with backoff inside GeminiProvider
         // and should propagate as LlmException so the caller sees the real error.
@@ -462,7 +511,11 @@ public sealed class IngestionService(
             var json = await llm.GenerateAsync(prompt, ct);
             try
             {
-                return ParseSections(json);
+                var parsed = ParseSections(json);
+                // Only a reply that parsed is saved, so a bad reply is never reused.
+                saved[sectionsKey] = json;
+                SaveProgress(documentId, saved);
+                return parsed;
             }
             catch (Exception ex) when (ex is not LlmException && attempt == 0)
             {
@@ -576,6 +629,46 @@ public sealed class IngestionService(
         }
 
         tx.Commit();
+    }
+
+    // ── Saved progress (resume after a failure) ────────────────────────────────
+    //
+    // Ingestion makes AI calls for the pictures (5 per call) and for the sections.
+    // If a later step fails, those answers would be paid for again on Retry. So each
+    // answer is saved in documents.ingest_progress as soon as it arrives, under a key
+    // made from the exact input that produced it (a hash). A retry only asks the AI
+    // for what is missing, and an answer is never reused for different input.
+    // The embeddings are not saved: they are the last step, and one call covers 100 chunks.
+
+    private static string ProgressKey(string kind, string input) =>
+        $"{kind}:{Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(input)))}";
+
+    private Dictionary<string, string> LoadProgress(int documentId)
+    {
+        using var conn = db.CreateConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT ingest_progress FROM documents WHERE id = @id";
+        cmd.Parameters.AddWithValue("@id", documentId);
+        var json = cmd.ExecuteScalar() as string;
+        try
+        {
+            return json is null ? [] : JsonSerializer.Deserialize<Dictionary<string, string>>(json) ?? [];
+        }
+        catch (JsonException)
+        {
+            return [];   // damaged: start from nothing
+        }
+    }
+
+    /// <summary>Stores the saved AI results of this document. null clears them.</summary>
+    private void SaveProgress(int documentId, Dictionary<string, string>? saved)
+    {
+        using var conn = db.CreateConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "UPDATE documents SET ingest_progress = @p WHERE id = @id";
+        cmd.Parameters.AddWithValue("@p", saved is null ? DBNull.Value : JsonSerializer.Serialize(saved));
+        cmd.Parameters.AddWithValue("@id", documentId);
+        cmd.ExecuteNonQuery();
     }
 
     // ── Status helper ──────────────────────────────────────────────────────────

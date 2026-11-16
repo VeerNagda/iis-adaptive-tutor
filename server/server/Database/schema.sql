@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS documents (
     error_message     TEXT,
     topics_extracted  INTEGER NOT NULL DEFAULT 0,   -- 1 once the document's sections were turned into topics
     ingest_report     TEXT,                         -- JSON counts of what ingestion did and did not do
+    -- JSON object of AI results already received while ingesting (picture descriptions, sections).
+    -- A retry reuses them instead of calling the AI again. Cleared when ingestion finishes.
+    ingest_progress   TEXT,
     uploaded_at       TEXT DEFAULT CURRENT_TIMESTAMP,
     deleted_at        TEXT,
     FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE CASCADE

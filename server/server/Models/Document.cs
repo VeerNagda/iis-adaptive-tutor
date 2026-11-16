@@ -73,6 +73,11 @@ public class IngestReport
     /// <summary>In a format that cannot be sent to the LLM, or damaged.</summary>
     public int ImagesUnreadable { get; set; }
 
+    /// <summary>AI results (picture batches, sections) kept from a failed attempt. A retry reuses them.</summary>
+    public int ResultsSaved { get; set; }
+    /// <summary>AI results this attempt took from an earlier attempt instead of calling the AI again.</summary>
+    public int ResultsReused { get; set; }
+
     /// <summary>The step that failed and why. Null when ingestion finished.</summary>
     public string? Failure { get; set; }
 }
